@@ -1,38 +1,39 @@
 [tool.poetry]
 name = "strot-ai"
-version = "0.1.3"
-description = "Build tools, agents, and pipelines for your STROT instance"
-authors = ["STROT AI <dev@strot.ai>"]
+version = "0.2.0"
+description = "STROT: compile-time LLM code synthesis with deterministic, self-routing NLU runtimes (local transformer or hosted API)"
+authors = ["Amit Rath <amitrath.ar@gmail.com>"]
 license = "MIT"
 readme = "README.md"
-homepage = "https://strot.ai"
-repository = "https://github.com/strot-ai/strot-sdk"
-keywords = ["strot", "ai", "agents", "pipelines"]
+repository = "https://github.com/strot-ai/Project-STROT"
+keywords = ["strot", "nlu", "code-generation", "llm", "routing", "compiler"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
+    "Typing :: Typed",
 ]
-packages = [
-    { include = "strot_ai", from = "src" },
-    { include = "strot_cli", from = "src" },
-]
+packages = [{ include = "strot", from = "src" }]
 
 [tool.poetry.dependencies]
 python = ">=3.9,<4.0"
-requests = ">=2.28"
-pyyaml = ">=6.0"
-click = ">=8.0"
-rich = ">=13.0"
+# The core library is pure-stdlib. Runtime strategies pull in heavy
+# dependencies only through extras, so a hosted-API production container
+# never ships torch/transformers.
+transformers = { version = ">=4.40", optional = true }
+torch = { version = ">=2.1", optional = true }
+openai = { version = ">=1.30", optional = true }
+
+[tool.poetry.extras]
+local = ["transformers", "torch"]
+hosted = ["openai"]
+all = ["transformers", "torch", "openai"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0"
 pytest-cov = "*"
-responses = ">=0.23"
-
-[tool.poetry.scripts]
-strot = "strot_cli.main:cli"
 
 [build-system]
 requires = ["poetry-core"]

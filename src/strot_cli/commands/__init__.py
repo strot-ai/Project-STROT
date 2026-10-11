@@ -1,1 +1,0 @@
-"""STROT CLI commands."""

@@ -1,186 +1,135 @@
-# STROT
+# Project STROT (`strot-ai`)
 
 [![PyPI](https://img.shields.io/pypi/v/strot-ai)](https://pypi.org/project/strot-ai/)
 [![Python](https://img.shields.io/pypi/pyversions/strot-ai)](https://pypi.org/project/strot-ai/)
 [![License](https://img.shields.io/pypi/l/strot-ai)](LICENSE)
 
-Build tools, agents, skills, pipelines, and dashboards for your [STROT](https://strot.ai) instance — in Python.
+**Compile-time LLM code synthesis, deterministic runtime routing.**
+
+An open-source implementation of the [STROT framework](https://arxiv.org/abs/2505.01636)
+(*Structured Task Reasoning and Output Transformation*) extended with an NLU
+strategy-pattern runtime: a large generative LLM scaffolds your execution
+paths **once at compile time**, and a small, fast NLU model routes every
+record **deterministically at runtime** — baked into a single standalone
+Python file.
+
+```
+┌──────────────────────── COMPILE TIME ────────────────────────┐
+│ dataset sample ─▶ schema introspection (Phase 1)             │
+│                ─▶ prompt scaffolding   (Phase 2)             │
+│                ─▶ LLM code synthesis + self-correction loop  │
+│                   (Phase 3, bounded retries on error traces) │
+│                ─▶ compiled_pipeline.py  (standalone asset)   │
+└──────────────────────────────────────────────────────────────┘
+┌───────────────────────── RUNTIME ────────────────────────────┐
+│ record ─▶ NLU router (local CPU transformer OR hosted API)   │
+│        ─▶ confidence >= 0.40 ? dispatch : FallbackException  │
+│        ─▶ statically compiled execution path                 │
+└──────────────────────────────────────────────────────────────┘
+```
 
 ## Installation
 
 ```bash
-pip install strot-ai
+pip install strot-ai            # core (pure stdlib)
+pip install strot-ai[local]     # + torch/transformers for local NLU
+pip install strot-ai[hosted]    # + openai for hosted NLU / synthesis
 ```
 
-## Quick Start
+## Quick start
+
+```python
+from strot import StrotCompiler
+from strot.compiler import openai_llm_client
+
+tickets = [
+    {"ticket_id": 101, "channel": "email", "body": "I was double charged"},
+    {"ticket_id": 102, "channel": "chat",  "body": "App crashes on export"},
+]
+
+compiler = StrotCompiler(
+    nlu_model="SupersonicLabs/Julia-1",     # default: local, CPU, Apache-2.0
+    llm_client=openai_llm_client("gpt-4o"), # the compile-time synthesizer
+)
+
+asset = compiler.compile(
+    sample=tickets,
+    goal="Triage incoming support tickets into the correct workflow.",
+    action_registry={
+        "billing_dispute":  "Refunds, invoice corrections, double charges",
+        "technical_defect": "Crashes, bugs, broken behavior",
+    },
+)
+asset.save("compiled_pipeline.py")          # completely self-contained
+```
+
+Then, anywhere in production (no `strot` dependency required):
+
+```python
+from compiled_pipeline import CompiledPipeline, FallbackException
+
+pipeline = CompiledPipeline()
+try:
+    outcome = pipeline.process({"ticket_id": 7, "body": "charged twice"})
+    print(outcome)  # {"action": "billing_dispute", "confidence": 0.93, "result": {...}}
+except FallbackException as exc:
+    quarantine(exc)  # confidence < 0.40 — never execute a random path
+```
+
+See [`examples/end_to_end.py`](examples/end_to_end.py) for the full
+walkthrough (it also runs offline with a stub synthesizer).
+
+## The two runtime architectures
+
+The `nlu_model` string selects which runtime gets compiled into the asset:
+
+**Implementation Alpha — local encoder** (default `SupersonicLabs/Julia-1`).
+Loads via `transformers`, forced onto `torch.device("cpu")`. Options are
+rendered in the Julia-1 token format (`Context: ...\nQuestion: ...\nOptions:
+...\nAnswer:`) and scored from the logits of a **single forward pass**
+(<40 ms on CPU). If the action registry exceeds 20 keys, an **Option Tree
+Splitter** decomposes the decision into a multi-tier hierarchy, since Julia-1
+accuracy degrades beyond 20 choices.
+
+**Implementation Beta — hosted API** (e.g. `openai/gpt-4o-mini`).
+An ultra-lightweight block: API keys from `os.environ`, **zero
+torch/transformers imports** (tiny container footprint), and Structured
+Outputs (strict JSON Schema) forcing the provider to return only the integer
+index of the winning execution path.
+
+Both runtimes enforce the same guard: if the calibrated confidence of the
+winning path is below **0.40**, the asset raises `FallbackException` instead
+of executing blindly.
+
+## API surface
+
+| Symbol | Role |
+| --- | --- |
+| `StrotCompiler` | Phase 1–3 orchestration: introspect → scaffold → synthesize → assemble |
+| `CompiledAsset` | The standalone artifact; `.save("compiled_pipeline.py")` |
+| `introspect_schema` | Schema profiler: semantic types, cardinality, null rates, samples |
+| `create_router` / `Router` | Library-side routing with confidence enforcement |
+| `LocalEncoderStrategy` / `HostedApiStrategy` | The two runtime strategies |
+| `FallbackException` | Raised when `max_probability < 0.40` |
+| `CompilationError` | Synthesis failed after the self-correction retry budget |
+
+## How the self-correction loop works
+
+Following the STROT paper's feedback-driven refinement phase, the compiler
+validates every LLM response before accepting it — syntax (`ast.parse`), the
+output contract (one `execute_<key>` function per registry entry), and an
+import blocklist (execution paths must stay stdlib-pure). On failure, the
+error trace and the rejected code are appended to the original prompt and the
+synthesizer retries, up to `max_retries` attempts, after which
+`CompilationError` is raised.
+
+## Development
 
 ```bash
-strot login                         # Authenticate
-strot init tool my-calculator       # Scaffold a project
-cd my-calculator                    # Edit main.py with any editor
-strot test                          # Validate locally
-strot deploy                        # Ship to your STROT instance
+poetry install --extras all
+poetry run pytest
 ```
-
-## What You Can Build
-
-| Type | Decorator | Description |
-|------|-----------|-------------|
-| **Tool** | `@function` | Reusable AI-callable functions (e.g., calculate ROI, parse CSV) |
-| **Agent** | `@agent` | AI agents with system prompts and tool access |
-| **Skill** | `@skill` | Multi-step AI workflows defined as markdown prompts |
-| **Pipeline** | `@cortex` | Data pipelines with LLM transforms, routing, and publishing |
-| **Dashboard** | `@page` | Interactive dashboards with KPIs, charts, and tables |
-
-## Examples
-
-### Tool
-
-```python
-from strot_ai import function, llm
-
-@function(
-    name='calculate_roi',
-    description='Calculate return on investment',
-    category='finance',
-    parameters=[
-        {'name': 'cost', 'type': 'number', 'description': 'Total cost'},
-        {'name': 'revenue', 'type': 'number', 'description': 'Total revenue'},
-    ],
-    returns={'type': 'number', 'description': 'ROI percentage'}
-)
-class CalculateROI:
-    def run(self, cost: float, revenue: float) -> float:
-        return ((revenue - cost) / cost) * 100
-```
-
-### Agent
-
-```python
-from strot_ai import agent
-
-@agent(
-    name='sales_analyst',
-    description='Analyzes sales data and provides insights',
-    tools=['calculate_roi', 'top_n'],
-    temperature=0.1,
-)
-class SalesAnalyst:
-    system_prompt = """You are a sales analyst.
-    Analyze data and provide actionable recommendations."""
-```
-
-### Skill
-
-```python
-from strot_ai import skill
-
-@skill(
-    name='dashboard_builder',
-    description='Build interactive dashboards from queries',
-    tools=['query_info', 'create_app', 'update_app', 'deploy_app'],
-    trigger='build.*dashboard|create.*dashboard',
-    emoji='📊',
-    examples=['Build a dashboard from query 4'],
-)
-class DashboardBuilder:
-    """## Workflow
-
-    ### Step 1: Analyze Data
-    Call `query_info` with the query_id to fetch schema and sample data.
-    Ask: "Does this data look right?"
-
-    ### Step 2: Map Data
-    Plan how columns map to dashboard sections.
-    Ask: "Does this mapping look good?"
-
-    ### Step 3: Build
-    Call `create_app` with the app_spec.
-    """
-```
-
-### Pipeline
-
-```python
-from strot_ai import cortex
-from strot_ai.cortex import Flow
-
-@cortex(name='daily_etl', description='Daily ETL pipeline')
-class DailyETL:
-    def build(self, flow: Flow):
-        data = flow.data_connector('load_sales', query_id=42)
-        cleaned = flow.transform(data, prompt='Clean and normalize the data')
-        flow.publish(cleaned, name='daily_report', destination='slack', channel='#data')
-```
-
-### Dashboard
-
-```python
-from strot_ai import page
-from strot_ai.pages import Dashboard, Row, KPI, Chart, Table
-
-@page(name='sales_dashboard', description='Sales overview', type='dashboard')
-class SalesDashboard:
-    def layout(self):
-        return Dashboard(
-            Row(
-                KPI(query_id=1, label='Revenue', format='currency'),
-                KPI(query_id=2, label='Orders'),
-                KPI(query_id=3, label='Customers'),
-            ),
-            Row(
-                Chart(query_id=5, type='line', title='Revenue Trend', span=8),
-                Chart(query_id=6, type='donut', title='By Region', span=4),
-            ),
-            Row(
-                Table(query_id=7, title='Recent Orders', sortable=True),
-            ),
-        )
-```
-
-## CLI Reference
-
-```bash
-strot login                              # Authenticate
-strot login --token sk_live_abc123       # Direct API key
-strot whoami                             # Show current user/org
-strot logout                             # Clear credentials
-
-strot init tool my-calculator            # Scaffold tool
-strot init agent my-analyst              # Scaffold agent
-strot init skill my-workflow             # Scaffold skill
-strot init cortex my-pipeline            # Scaffold pipeline
-strot init page my-dashboard             # Scaffold dashboard
-
-strot test                               # Validate locally
-strot deploy                             # Deploy to STROT
-strot deploy --dry-run                   # Validate without deploying
-
-strot resources                          # List all resources
-strot resources queries                  # List saved queries
-strot resources datasources              # List data sources
-```
-
-## Documentation
-
-See [docs/guide.md](docs/guide.md) for the full SDK guide covering all decorators, built-in modules, configuration, and advanced patterns.
-
-## Configuration
-
-Credentials stored in `~/.strot/credentials`:
-
-```yaml
-version: 1
-current_profile: default
-profiles:
-  default:
-    url: https://app.strot.ai
-    api_key: sk_live_abc123
-    org: 98bf9a0a-c9cd-42a8-9ea4-4f7fee9a4535
-```
-
-**Priority:** Constructor args > Environment variables (`STROT_URL`, `STROT_API_KEY`) > Credentials file
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
