@@ -138,6 +138,18 @@ def claude_cli_llm_client(
     return _call
 
 
+def _sample_records(sample: Any) -> List[Dict[str, Any]]:
+    """Normalize any supported sample shape into a list of dict records."""
+    from .schema import SchemaProfiler
+
+    columns = SchemaProfiler()._normalize(sample)
+    length = max(len(values) for values in columns.values())
+    return [
+        {name: (values[i] if i < len(values) else None) for name, values in columns.items()}
+        for i in range(length)
+    ]
+
+
 def handler_name(action_key: str) -> str:
     """Map an action-registry key to its compiled function name."""
     sanitized = re.sub(r"\W+", "_", action_key).strip("_").lower()
@@ -243,30 +255,36 @@ class StrotCompiler:
         )
 
     def build_research_prompt(self, schema: DatasetSchema, goal: str) -> str:
-        """Construct the synthesizer prompt for research (analysis) mode."""
+        """Construct the research-mode prompt: a plan of SQL template tool calls."""
+        from . import sqltools
+
         return "\n".join(
             [
-                "You are the STROT synthesizer. Generate production Python "
-                "analysis code.",
+                "You are the STROT synthesizer agent. Plan an analysis by "
+                "calling pre-coded SQL template tools - you configure tools, "
+                "you do not write code.",
                 "",
-                "## VERIFIED DATASET SCHEMA",
+                "## VERIFIED DATASET SCHEMA (DuckDB table `records`)",
                 schema.to_json(),
                 "",
                 "## RESEARCH GOAL",
                 goal,
                 "",
-                "## OUTPUT CONTRACT",
-                "Emit exactly one ```python code block containing a single "
-                "top-level function, fully implemented against the schema above:",
-                "- `def analyze(records: list) -> dict:` computes the goal's "
-                "insights over the full record list.",
+                "## AVAILABLE TOOLS",
+                sqltools.render_catalog(),
                 "",
-                "Rules: pure standard library only (statistics, math, collections "
-                "are fine); robust to missing/None values; full type hints; no "
-                "I/O, no network calls, no imports of torch/transformers/openai/"
-                "julia; every value in the returned dict must be computed from "
-                "the records (never invented) and JSON-serializable; descriptive "
-                "snake_case keys.",
+                "## OUTPUT CONTRACT",
+                "Emit exactly one ```python code block containing ONLY one "
+                "module-level literal assignment:",
+                '- `PLAN = [{"name": "<snake_case_insight>", "tool": "<tool>", '
+                '"params": {...}}, ...]`',
+                "",
+                "Rules: 3-12 plan items, each answering part of the goal; "
+                "insight names unique and descriptive; column names exactly as "
+                "in the schema; prefer template tools - use raw_sql only when "
+                "no template fits (it must be a single read-only SELECT over "
+                "`records`; temporal columns are stored as VARCHAR, CAST as "
+                "needed). No other statements, functions, or imports.",
             ]
         )
 
@@ -280,6 +298,14 @@ class StrotCompiler:
         expected_functions: List[str],
         label_keys: Optional[List[str]] = None,
     ) -> "tuple[str, int]":
+        return self._synthesize_with(
+            prompt,
+            lambda code: self._validate_candidate(code, expected_functions, label_keys),
+        )
+
+    def _synthesize_with(
+        self, prompt: str, validate: Callable[[str], Optional[str]]
+    ) -> "tuple[str, int]":
         if self.llm_client is None:
             raise CompilationError(
                 "No llm_client configured. Pass a callable (e.g. "
@@ -292,7 +318,7 @@ class StrotCompiler:
         for attempt in range(1, self.max_retries + 1):
             raw = self.llm_client(current_prompt)
             candidate = self._extract_code(raw)
-            error = self._validate_candidate(candidate, expected_functions, label_keys)
+            error = validate(candidate)
             if error is None:
                 return candidate, attempt
             last_error = error
@@ -449,16 +475,102 @@ class StrotCompiler:
             attempts=attempts,
         )
 
-    def compile_research(self, sample: Any, goal: str) -> CompiledAsset:
-        """Research mode: synthesize a model-free analysis asset.
+    @staticmethod
+    def _extract_plan(code: str) -> "tuple[Optional[Any], Optional[str]]":
+        """Parse a research candidate: module body must be ONLY the PLAN literal."""
+        if not code:
+            return None, "The response contained no code."
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as exc:
+            return None, f"SyntaxError at line {exc.lineno}: {exc.msg}"
+        plan_node = None
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(isinstance(t, ast.Name) and t.id == "PLAN" for t in targets):
+                    plan_node = node.value
+                    continue
+            return None, (
+                "The research plan must contain ONLY the PLAN literal "
+                "assignment - no functions, imports, or other statements."
+            )
+        if plan_node is None:
+            return None, "Missing required module-level literal PLAN."
+        try:
+            return ast.literal_eval(plan_node), None
+        except (ValueError, SyntaxError):
+            return None, "PLAN must be a literal list of tool-call objects."
 
-        No action registry, no router, no runtime model - the LLM writes
-        ``analyze(records) -> dict`` once against the verified schema, and
-        every number the asset ever outputs is computed by that code.
+    def compile_research(self, sample: Any, goal: str) -> CompiledAsset:
+        """Research mode: the agent calls SQL template tools; DuckDB executes.
+
+        No action registry, no router, no runtime model. The synthesis agent
+        emits a PLAN of pre-coded tool calls; parameters are validated against
+        the verified schema, expanded into SQL, and every query is executed
+        against the sample before the asset is accepted — so every number the
+        asset ever outputs is computed by DuckDB, never generated.
         """
+        try:
+            import duckdb
+        except ImportError as exc:
+            raise RouterConfigurationError(
+                "Research mode compiles and validates DuckDB SQL plans: "
+                "pip install strot-ai[research]"
+            ) from exc
+        from . import sqltools
+
         schema = introspect_schema(sample)
+        records = _sample_records(sample)
+        expanded: Dict[str, str] = {}
+
+        def validate(code: str) -> Optional[str]:
+            plan, error = self._extract_plan(code)
+            if error:
+                return error
+            try:
+                queries = sqltools.expand_plan(plan, schema)
+            except ValueError as exc:
+                return str(exc)
+            con = duckdb.connect(database=":memory:")
+            try:
+                duck_types = {
+                    "numerical": "DOUBLE",
+                    "boolean": "BOOLEAN",
+                }
+                columns = ", ".join(
+                    '"{0}" {1}'.format(
+                        f.name, duck_types.get(f.semantic_type, "VARCHAR")
+                    )
+                    for f in schema.fields
+                )
+                con.execute("CREATE TABLE records ({0})".format(columns))
+                if records:
+                    placeholders = ", ".join("?" for _ in schema.fields)
+                    con.executemany(
+                        "INSERT INTO records VALUES ({0})".format(placeholders),
+                        [
+                            tuple(r[f.name] for f in schema.fields)
+                            for r in records
+                        ],
+                    )
+                for name, sql in queries.items():
+                    try:
+                        con.execute(sql)
+                    except Exception as exc:
+                        return f"query {name!r} failed against the sample: {exc}"
+            finally:
+                con.close()
+            expanded.clear()
+            expanded.update(queries)
+            return None
+
         prompt = self.build_research_prompt(schema, goal)
-        generated, attempts = self._synthesize_paths(prompt, ["analyze"])
+        _, attempts = self._synthesize_with(prompt, validate)
+        queries_literal = "QUERIES: Dict[str, str] = {\n" + "".join(
+            f"    {name!r}: {sql!r},\n" for name, sql in expanded.items()
+        ) + "}"
+        generated = queries_literal
         source = (
             "\n\n".join(
                 [
