@@ -19,6 +19,13 @@ REGISTRY = {
 }
 
 VALID_PATHS = '''```python
+ROUTING_LABELS = {"billing": "billing charge", "defect": "app crash"}
+
+
+def route_context(record: dict) -> str:
+    return str(record.get("body", ""))
+
+
 def execute_billing(record: dict) -> dict:
     try:
         return {"queue": "billing", "ticket_id": record.get("ticket_id")}
@@ -60,6 +67,23 @@ class TestPromptScaffolding:
         assert "triage tickets" in prompt
         assert "SupersonicLabs/Julia-1" in prompt
         assert "execute_billing" in prompt and "execute_defect" in prompt
+        assert "ROUTING_LABELS" in prompt and "route_context" in prompt
+
+    def test_missing_routing_labels_feeds_back_and_retries(self):
+        no_labels = VALID_PATHS.replace(
+            'ROUTING_LABELS = {"billing": "billing charge", "defect": "app crash"}', ""
+        )
+        llm = ScriptedLLM([no_labels, VALID_PATHS])
+        asset = make_compiler(llm).compile(SAMPLE, "triage", REGISTRY)
+        assert asset.attempts == 2
+        assert "ROUTING_LABELS" in llm.prompts[1]
+
+    def test_mismatched_label_keys_rejected(self):
+        wrong_keys = VALID_PATHS.replace('"defect": "app crash"', '"other": "app crash"')
+        llm = ScriptedLLM([wrong_keys, VALID_PATHS])
+        asset = make_compiler(llm).compile(SAMPLE, "triage", REGISTRY)
+        assert asset.attempts == 2
+        assert "exactly match the action keys" in llm.prompts[1]
 
 
 class TestSelfCorrectionLoop:
@@ -82,6 +106,8 @@ class TestSelfCorrectionLoop:
     def test_forbidden_imports_are_rejected(self):
         heavy = (
             "```python\nimport torch\n"
+            'ROUTING_LABELS = {"billing": "billing", "defect": "defect"}\n'
+            "def route_context(record: dict) -> str:\n    return str(record)\n"
             "def execute_billing(record: dict) -> dict:\n    return {}\n"
             "def execute_defect(record: dict) -> dict:\n    return {}\n```"
         )

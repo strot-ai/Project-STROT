@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "strot-ai"
-version = "0.2.0"
+version = "0.3.0"
 description = "STROT: compile-time LLM code synthesis with deterministic, self-routing NLU runtimes (local transformer or hosted API)"
 authors = ["Amit Rath <amitrath.ar@gmail.com>"]
 license = "MIT"

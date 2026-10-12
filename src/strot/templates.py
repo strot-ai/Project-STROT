@@ -258,9 +258,9 @@ ACTION_REGISTRY: Dict[str, str] = {registry_literal}
 
 _HANDLERS = {handlers_literal}
 
-_ROUTING_OPTIONS: List[str] = [
-    "{{0}} -- {{1}}".format(key, desc) for key, desc in ACTION_REGISTRY.items()
-]
+#: The decision model sees ONLY these compile-time-synthesized labels;
+#: short discriminative labels measurably outperform verbose descriptions.
+_ROUTING_OPTIONS: List[str] = [ROUTING_LABELS[key] for key in ACTION_REGISTRY]
 _ACTION_KEYS: List[str] = list(ACTION_REGISTRY)
 
 
@@ -276,7 +276,7 @@ class CompiledPipeline:
         record: Mapping[str, Any],
         question: str = {default_question!r},
     ) -> Dict[str, Any]:
-        context = json.dumps(record, default=str, sort_keys=True)
+        context = route_context(dict(record))  # compile-time-synthesized projection
         decision = self._router.select(context, question, _ROUTING_OPTIONS)
         if decision.confidence < CONFIDENCE_THRESHOLD:
             raise FallbackException(

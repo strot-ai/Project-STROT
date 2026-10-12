@@ -204,6 +204,17 @@ class StrotCompiler:
             f"{key!r} ({desc})"
             for key, desc in action_registry.items()
         ]
+        contract_lines += [
+            "- `ROUTING_LABELS: Dict[str, str]` module-level literal dict mapping "
+            f"EVERY action key ({', '.join(map(repr, action_registry))}) to a "
+            "short routing label: 1-4 lowercase words, mutually distinct, using "
+            "vocabulary that appears in the records themselves. The runtime "
+            "decision model sees ONLY these labels as its options - short, "
+            "discriminative labels dramatically outperform long descriptions.",
+            "- `def route_context(record: dict) -> str:` projects ONLY the "
+            "fields relevant to choosing an action into a compact string for "
+            "the decision model; drop irrelevant or noisy fields.",
+        ]
         return "\n".join(
             [
                 "You are the STROT synthesizer. Generate production Python code.",
@@ -263,7 +274,12 @@ class StrotCompiler:
     # Phase 3: feedback-driven synthesis with self-correction             #
     # ------------------------------------------------------------------ #
 
-    def _synthesize_paths(self, prompt: str, expected_functions: List[str]) -> "tuple[str, int]":
+    def _synthesize_paths(
+        self,
+        prompt: str,
+        expected_functions: List[str],
+        label_keys: Optional[List[str]] = None,
+    ) -> "tuple[str, int]":
         if self.llm_client is None:
             raise CompilationError(
                 "No llm_client configured. Pass a callable (e.g. "
@@ -276,7 +292,7 @@ class StrotCompiler:
         for attempt in range(1, self.max_retries + 1):
             raw = self.llm_client(current_prompt)
             candidate = self._extract_code(raw)
-            error = self._validate_candidate(candidate, expected_functions)
+            error = self._validate_candidate(candidate, expected_functions, label_keys)
             if error is None:
                 return candidate, attempt
             last_error = error
@@ -294,7 +310,11 @@ class StrotCompiler:
         return (match.group(1) if match else raw).strip()
 
     @staticmethod
-    def _validate_candidate(code: str, expected_functions: List[str]) -> Optional[str]:
+    def _validate_candidate(
+        code: str,
+        expected_functions: List[str],
+        label_keys: Optional[List[str]] = None,
+    ) -> Optional[str]:
         """Return a human-readable validation error, or None if the code is valid."""
         if not code:
             return "The response contained no code."
@@ -308,6 +328,10 @@ class StrotCompiler:
         missing = [name for name in expected_functions if name not in defined]
         if missing:
             return f"Missing required function definitions: {', '.join(missing)}"
+        if label_keys is not None:
+            error = StrotCompiler._validate_routing_labels(tree, label_keys)
+            if error:
+                return error
         forbidden = {"torch", "transformers", "openai", "julia", "huggingface_hub"}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -319,6 +343,39 @@ class StrotCompiler:
             bad = names & forbidden
             if bad:
                 return f"Forbidden imports in execution paths: {', '.join(sorted(bad))}"
+        return None
+
+    @staticmethod
+    def _validate_routing_labels(tree: ast.Module, label_keys: List[str]) -> Optional[str]:
+        """Check the module-level ROUTING_LABELS literal against the registry."""
+        value_node = None
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "ROUTING_LABELS" for t in node.targets
+            ):
+                value_node = node.value
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "ROUTING_LABELS"
+            ):
+                value_node = node.value
+        if value_node is None:
+            return "Missing required module-level constant ROUTING_LABELS."
+        try:
+            labels = ast.literal_eval(value_node)
+        except (ValueError, SyntaxError):
+            return "ROUTING_LABELS must be a literal dict of str -> str."
+        if not isinstance(labels, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) and v.strip()
+            for k, v in labels.items()
+        ):
+            return "ROUTING_LABELS must be a literal dict of str -> non-empty str."
+        if set(labels) != set(label_keys):
+            return (
+                "ROUTING_LABELS keys must exactly match the action keys: "
+                f"{', '.join(label_keys)}"
+            )
         return None
 
     @staticmethod
@@ -369,8 +426,11 @@ class StrotCompiler:
             raise CompilationError(
                 "Action keys collide after sanitization; use distinct keys.", attempts=0
             )
+        expected = expected + ["route_context"]
         prompt = self.build_synthesis_prompt(schema, goal, action_registry)
-        generated_paths, attempts = self._synthesize_paths(prompt, expected)
+        generated_paths, attempts = self._synthesize_paths(
+            prompt, expected, label_keys=list(action_registry)
+        )
         source = self._assemble(schema, goal, dict(action_registry), generated_paths, question)
         try:
             ast.parse(source)

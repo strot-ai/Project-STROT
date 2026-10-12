@@ -32,20 +32,31 @@ REGISTRY = {
 
 QUERY = "Triage incoming tickets into the correct workflow."
 
-VALID_PATHS = '''```python
-def execute_billing(record: dict) -> dict:
-    try:
-        return {"queue": "billing", "ticket_id": record.get("ticket_id")}
-    except Exception as exc:
-        return {"queue": "billing", "error": str(exc)}
+def make_paths(keys):
+    """Contract-compliant synthesizer output for the given action keys.
+
+    Labels are the bare keys so the fake keyword router matches them against
+    the record body (e.g. body "double billing charge" -> label "billing").
+    """
+    labels = ", ".join(f'"{k}": "{k}"' for k in keys)
+    handlers = "\n\n\n".join(
+        f'def execute_{k}(record: dict) -> dict:\n'
+        f'    try:\n'
+        f'        return {{"queue": "{k}", "ticket_id": record.get("ticket_id")}}\n'
+        f'    except Exception as exc:\n'
+        f'        return {{"queue": "{k}", "error": str(exc)}}'
+        for k in keys
+    )
+    return (
+        "```python\n"
+        f"ROUTING_LABELS = {{{labels}}}\n\n\n"
+        "def route_context(record: dict) -> str:\n"
+        '    return str(record.get("body", ""))\n\n\n'
+        f"{handlers}\n```"
+    )
 
 
-def execute_defect(record: dict) -> dict:
-    try:
-        return {"queue": "engineering", "ticket_id": record.get("ticket_id")}
-    except Exception as exc:
-        return {"queue": "engineering", "error": str(exc)}
-```'''
+VALID_PATHS = make_paths(["billing", "defect"])
 
 
 class ScriptedLLM:
@@ -235,14 +246,7 @@ class TestRun:
         # Three actions so a zero-overlap record ties at ~0.33 < 0.40; with
         # only two, a tie sits at exactly 0.5 and would still dispatch.
         registry3 = dict(REGISTRY, lifecycle="Account deletion and data export requests")
-        paths3 = VALID_PATHS[: VALID_PATHS.rindex("```")] + '''
-
-def execute_lifecycle(record: dict) -> dict:
-    try:
-        return {"queue": "trust", "ticket_id": record.get("ticket_id")}
-    except Exception as exc:
-        return {"queue": "trust", "error": str(exc)}
-```'''
+        paths3 = make_paths(["billing", "defect", "lifecycle"])
         with_unroutable = SAMPLE + [{"ticket_id": 3, "body": "zzz qqq", "tier": None}]
         result = strot.run(
             with_unroutable, QUERY, registry3, llm=ScriptedLLM([paths3]), state=tmp_path
