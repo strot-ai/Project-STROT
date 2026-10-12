@@ -30,6 +30,7 @@ from .compiler import (
     CompiledAsset,
     LLMClient,
     StrotCompiler,
+    anthropic_llm_client,
     claude_cli_llm_client,
     openai_llm_client,
 )
@@ -145,13 +146,15 @@ def _resolve_llm(llm: LLMSpec) -> LLMClient:
         provider, slash, model = llm.partition("/")
         if provider in ("claude-cli", "claude-code"):
             return claude_cli_llm_client(model=model or None)
+        if provider == "anthropic":
+            return anthropic_llm_client(model) if model else anthropic_llm_client()
         if provider == "openai":
             return openai_llm_client(model)
         if not slash:  # bare model name, e.g. "gpt-4o"
             return openai_llm_client(llm)
     raise RouterConfigurationError(
-        f"Cannot resolve llm spec {llm!r}; pass a callable, 'openai/<model>', "
-        "a bare OpenAI model name, or 'claude-cli[/<model>]'."
+        f"Cannot resolve llm spec {llm!r}; pass a callable, 'anthropic/<model>', "
+        "'openai/<model>', a bare OpenAI model name, or 'claude-cli[/<model>]'."
     )
 
 

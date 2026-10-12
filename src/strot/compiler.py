@@ -61,6 +61,41 @@ def openai_llm_client(model: str = "gpt-4o", temperature: float = 0.0) -> LLMCli
     return _call
 
 
+def anthropic_llm_client(
+    model: str = "claude-opus-4-8",
+    max_tokens: int = 16000,
+) -> LLMClient:
+    """Convenience factory: a synthesizer client backed by the Anthropic API.
+
+    Requires the ``anthropic`` package (``pip install strot-ai[anthropic]``)
+    and ``ANTHROPIC_API_KEY`` in the environment.
+    """
+    try:
+        from anthropic import Anthropic
+    except ImportError as exc:
+        raise RouterConfigurationError(
+            "anthropic_llm_client requires the 'anthropic' extra: "
+            "pip install strot-ai[anthropic]"
+        ) from exc
+    client = Anthropic()
+
+    def _call(prompt: str) -> str:
+        response = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if response.stop_reason == "refusal":
+            raise CompilationError(
+                "Anthropic synthesizer refused the request.", attempts=0
+            )
+        return "".join(
+            block.text for block in response.content if block.type == "text"
+        )
+
+    return _call
+
+
 def claude_cli_llm_client(
     model: Optional[str] = None,
     cli: str = "claude",

@@ -7,6 +7,7 @@ enough to exercise the full compiled code path (route -> threshold ->
 dispatch) without the heavyweight extras.
 """
 
+import importlib.util
 import json
 import math
 import sys
@@ -334,3 +335,9 @@ def execute_lifecycle(record: dict) -> dict:
     def test_unresolvable_llm_spec_raises(self, tmp_path):
         with pytest.raises(RouterConfigurationError):
             strot.run(SAMPLE, QUERY, REGISTRY, llm=12345, state=tmp_path)
+
+    def test_anthropic_spec_requires_extra_when_missing(self, tmp_path):
+        if importlib.util.find_spec("anthropic") is not None:
+            pytest.skip("anthropic installed; factory would construct a real client")
+        with pytest.raises(RouterConfigurationError, match="anthropic"):
+            strot.run(SAMPLE, QUERY, REGISTRY, llm="anthropic/claude-opus-4-8", state=tmp_path)

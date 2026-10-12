@@ -10,6 +10,7 @@ cloud API, baked into a standalone compiled production asset.
 from .compiler import (
     CompiledAsset,
     StrotCompiler,
+    anthropic_llm_client,
     claude_cli_llm_client,
     openai_llm_client,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "CompiledAsset",
     "StrotCompiler",
     "openai_llm_client",
+    "anthropic_llm_client",
     "claude_cli_llm_client",
     "StrotError",
     "CompilationError",
