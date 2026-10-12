@@ -7,7 +7,12 @@ a local CPU transformer (default ``SupersonicLabs/Julia-1``) or a hosted
 cloud API, baked into a standalone compiled production asset.
 """
 
-from .compiler import CompiledAsset, StrotCompiler, openai_llm_client
+from .compiler import (
+    CompiledAsset,
+    StrotCompiler,
+    claude_cli_llm_client,
+    openai_llm_client,
+)
 from .exceptions import (
     CompilationError,
     FallbackException,
@@ -31,10 +36,15 @@ from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_sche
 
 __version__ = "0.2.0"
 
+from .jit import RunResult, run  # noqa: E402  (needs __version__ for cache keys)
+
 __all__ = [
+    "run",
+    "RunResult",
     "CompiledAsset",
     "StrotCompiler",
     "openai_llm_client",
+    "claude_cli_llm_client",
     "StrotError",
     "CompilationError",
     "FallbackException",

@@ -61,6 +61,48 @@ def openai_llm_client(model: str = "gpt-4o", temperature: float = 0.0) -> LLMCli
     return _call
 
 
+def claude_cli_llm_client(
+    model: Optional[str] = None,
+    cli: str = "claude",
+    timeout: float = 600.0,
+) -> LLMClient:
+    """Convenience factory: use a local Claude Code CLI as an LLM proxy.
+
+    Shells out to ``claude -p`` in headless mode, so synthesis rides the
+    developer's existing Claude session — no API key, no SDK dependency.
+    """
+    import shutil
+    import subprocess
+
+    cli_path = shutil.which(cli)
+    if cli_path is None:
+        raise RouterConfigurationError(
+            f"claude_cli_llm_client requires the {cli!r} CLI on PATH "
+            "(install Claude Code: https://claude.com/claude-code)."
+        )
+
+    def _call(prompt: str) -> str:
+        command = [cli_path, "-p", "--output-format", "text"]
+        if model:
+            command += ["--model", model]
+        proc = subprocess.run(
+            command,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            raise CompilationError(
+                f"claude CLI synthesizer exited {proc.returncode}: "
+                f"{proc.stderr.strip()[:500]}",
+                attempts=0,
+            )
+        return proc.stdout
+
+    return _call
+
+
 def handler_name(action_key: str) -> str:
     """Map an action-registry key to its compiled function name."""
     sanitized = re.sub(r"\W+", "_", action_key).strip("_").lower()

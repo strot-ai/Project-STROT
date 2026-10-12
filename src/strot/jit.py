@@ -1,0 +1,283 @@
+"""The production JIT front door: :func:`strot.run`.
+
+STROT as a *production* compiler, not a dev tool. Developers set only the
+intent (a natural-language query plus an action registry); the compile event
+happens wherever :func:`run` is first called — typically in production — and
+the resulting asset is persisted to a content-addressed artifact store. Every
+subsequent call (and every restart sharing the ``state`` directory) is a pure
+cache hit: no LLM, no API key, just deterministic execution.
+
+    key = hash(query + schema fingerprint + registry + nlu + version)
+    ├─ artifact exists  ──▶ load compiled code, execute          (every call)
+    └─ cache miss       ──▶ LLM synthesizes, validate, persist   (once)
+
+The schema fingerprint is part of the key, so schema drift in the live data
+automatically misses the cache and triggers exactly one recompile against
+the new reality.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
+
+from .compiler import (
+    CompiledAsset,
+    LLMClient,
+    StrotCompiler,
+    claude_cli_llm_client,
+    openai_llm_client,
+)
+from .exceptions import RouterConfigurationError, SchemaIntrospectionError
+from .router import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL
+from .schema import DatasetSchema, introspect_schema
+
+#: ``llm`` parameter: a client callable, or a lazy spec string resolved only
+#: on a cache miss ("openai/gpt-4o", "gpt-4o", "claude-cli", "claude-cli/sonnet").
+LLMSpec = Union[str, LLMClient]
+
+_KEY_PREFIX_LEN = 16
+
+
+@dataclass
+class RunResult:
+    """Outcome of one :func:`run` call over a dataset."""
+
+    outcomes: List[Dict[str, Any]]
+    fallbacks: List[Dict[str, Any]]
+    artifact_path: Path
+    cache_hit: bool
+    cache_key: str
+    pipeline: Any = None  #: live CompiledPipeline for streaming further records
+    attempts: int = 0  #: synthesizer attempts (0 on a cache hit)
+
+    def summary(self) -> Dict[str, Any]:
+        per_action: Dict[str, int] = {}
+        for outcome in self.outcomes:
+            per_action[outcome["action"]] = per_action.get(outcome["action"], 0) + 1
+        return {
+            "processed": len(self.outcomes),
+            "fallbacks": len(self.fallbacks),
+            "actions": per_action,
+            "cache_hit": self.cache_hit,
+            "artifact": str(self.artifact_path),
+        }
+
+
+def as_records(data: Any) -> List[Dict[str, Any]]:
+    """Normalize a DataFrame-like, dict-of-lists, or list-of-dicts into records."""
+    if hasattr(data, "to_dict") and not isinstance(data, Mapping):
+        return [dict(r) for r in data.to_dict(orient="records")]
+    if isinstance(data, Mapping):
+        if any(not isinstance(v, (list, tuple)) for v in data.values()):
+            raise SchemaIntrospectionError(
+                "Column-oriented data must map each header to a sequence of values."
+            )
+        columns = {str(k): list(v) for k, v in data.items()}
+        if not columns:
+            raise SchemaIntrospectionError("Dataset contains no columns.")
+        length = max(len(v) for v in columns.values())
+        return [
+            {k: (v[i] if i < len(v) else None) for k, v in columns.items()}
+            for i in range(length)
+        ]
+    if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+        records = list(data)
+        if not records:
+            raise SchemaIntrospectionError("Dataset is empty; cannot derive a schema.")
+        if not all(isinstance(r, Mapping) for r in records):
+            raise SchemaIntrospectionError(
+                "Record-oriented data must be a sequence of mappings (dict rows)."
+            )
+        return [dict(r) for r in records]
+    raise SchemaIntrospectionError(
+        f"Unsupported data type {type(data).__name__!r}; "
+        "expected a DataFrame-like object, list of dicts, or dict of lists."
+    )
+
+
+def schema_fingerprint(schema: DatasetSchema) -> List[List[str]]:
+    """Structural identity of a schema: names and types, not sample values.
+
+    Cardinality, null rates, and sample values vary batch to batch and must
+    not churn the cache key; a changed column set or type is real drift and
+    must miss the cache.
+    """
+    return sorted(
+        [f.name, f.semantic_type, f.python_type] for f in schema.fields
+    )
+
+
+def cache_key(
+    query: str,
+    action_registry: Mapping[str, str],
+    nlu: str,
+    schema: DatasetSchema,
+    question: Optional[str],
+    confidence_threshold: float,
+) -> str:
+    from . import __version__
+
+    payload = {
+        "strot": __version__,
+        "query": query,
+        "registry": list(action_registry.items()),
+        "nlu": nlu,
+        "question": question,
+        "threshold": confidence_threshold,
+        "schema": schema_fingerprint(schema),
+    }
+    canonical = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _resolve_llm(llm: LLMSpec) -> LLMClient:
+    """Resolve the synthesizer client. Called ONLY on a cache miss, so a warm
+    production box never needs the LLM dependency or its API key."""
+    if callable(llm):
+        return llm
+    if isinstance(llm, str) and llm:
+        provider, slash, model = llm.partition("/")
+        if provider in ("claude-cli", "claude-code"):
+            return claude_cli_llm_client(model=model or None)
+        if provider == "openai":
+            return openai_llm_client(model)
+        if not slash:  # bare model name, e.g. "gpt-4o"
+            return openai_llm_client(llm)
+    raise RouterConfigurationError(
+        f"Cannot resolve llm spec {llm!r}; pass a callable, 'openai/<model>', "
+        "a bare OpenAI model name, or 'claude-cli[/<model>]'."
+    )
+
+
+def _artifact_paths(state: Union[str, Path], key: str) -> "tuple[Path, Path]":
+    state_dir = Path(state)
+    stem = f"strot_{key[:_KEY_PREFIX_LEN]}"
+    return state_dir / f"{stem}.py", state_dir / f"{stem}.json"
+
+
+def _load_artifact(path: Path, key: str) -> Any:
+    module_name = f"strot_compiled_{key[:_KEY_PREFIX_LEN]}"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        del sys.modules[module_name]
+        raise RouterConfigurationError(
+            f"Compiled artifact {path} failed to load: {exc}. The local runtime "
+            "needs strot-ai[local] (torch/transformers); the hosted runtime "
+            "needs strot-ai[hosted] (openai)."
+        ) from exc
+    return module
+
+
+def run(
+    data: Any,
+    query: str,
+    action_registry: Mapping[str, str],
+    llm: LLMSpec = "openai/gpt-4o",
+    nlu: str = DEFAULT_NLU_MODEL,
+    state: Union[str, Path] = ".strot",
+    sample_size: int = 25,
+    max_retries: int = 3,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    question: Optional[str] = None,
+    execute: bool = True,
+) -> RunResult:
+    """Process ``data`` against ``query``, JIT-compiling the pipeline on first use.
+
+    Args:
+        data: The dataset — DataFrame-like, list of dict records, or dict of
+            column lists. The first ``sample_size`` records also serve as the
+            synthesis/validation sample on a cache miss.
+        query: The functional goal in natural language (the paper's ``goal``).
+        action_registry: Ordered mapping of action key -> description; defines
+            the routing decision space enforced on the NLU model.
+        llm: Synthesizer spec or callable; resolved lazily, only on cache miss.
+        nlu: Runtime router model baked into the artifact (local or hosted).
+        state: Artifact-store directory — the persisted "compiled flag + code".
+        sample_size: Records used for schema profiling and synthesis grounding.
+        max_retries: Feedback-driven synthesis budget on a cache miss.
+        confidence_threshold: Routing confidence below this raises the
+            compiled asset's FallbackException instead of executing a path.
+        question: Optional override of the routing question baked into the asset.
+        execute: If False, only ensure the artifact exists (warm the cache)
+            without loading the runtime — useful on boxes without the runtime
+            extras installed.
+    """
+    records = as_records(data)
+    sample = records[:sample_size]
+    schema = introspect_schema(sample)
+    key = cache_key(query, action_registry, nlu, schema, question, confidence_threshold)
+    artifact_path, meta_path = _artifact_paths(state, key)
+
+    cache_hit = artifact_path.exists()
+    attempts = 0
+    if not cache_hit:
+        compiler = StrotCompiler(
+            nlu_model=nlu,
+            llm_client=_resolve_llm(llm),
+            max_retries=max_retries,
+            confidence_threshold=confidence_threshold,
+        )
+        asset: CompiledAsset = compiler.compile(
+            sample=sample,
+            goal=query,
+            action_registry=action_registry,
+            question=question,
+        )
+        attempts = asset.attempts
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        asset.save(artifact_path)
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "cache_key": key,
+                    "query": query,
+                    "nlu": nlu,
+                    "runtime_kind": asset.runtime_kind,
+                    "attempts": asset.attempts,
+                    "action_registry": dict(action_registry),
+                    "schema": schema_fingerprint(schema),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    result = RunResult(
+        outcomes=[],
+        fallbacks=[],
+        artifact_path=artifact_path,
+        cache_hit=cache_hit,
+        cache_key=key,
+        attempts=attempts,
+    )
+    if not execute:
+        return result
+
+    module = _load_artifact(artifact_path, key)
+    result.pipeline = module.CompiledPipeline()
+    for index, record in enumerate(records):
+        try:
+            outcome = result.pipeline.process(record)
+            result.outcomes.append({"index": index, "record": record, **outcome})
+        except module.FallbackException as exc:
+            result.fallbacks.append(
+                {
+                    "index": index,
+                    "record": record,
+                    "confidence": exc.confidence,
+                    "reason": str(exc),
+                }
+            )
+    return result
