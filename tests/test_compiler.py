@@ -106,7 +106,8 @@ class TestAssetAssembly:
         asset = make_compiler(ScriptedLLM([VALID_PATHS])).compile(SAMPLE, "triage", REGISTRY)
         ast.parse(asset.source)
         assert asset.runtime_kind == "local"
-        assert 'torch.device("cpu")' in asset.source
+        assert "from julia import load_model" in asset.source
+        assert 'device="cpu"' in asset.source
         assert 'NLU_MODEL = \'SupersonicLabs/Julia-1\'' in asset.source
 
     def test_hosted_asset_is_valid_python_and_torch_free(self):

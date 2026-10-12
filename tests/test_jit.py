@@ -1,10 +1,10 @@
 """Tests for strot.run(): the production JIT facade.
 
-The compiled local artifact imports torch/transformers at module scope, so
-these tests install a minimal pure-Python fake of both libraries that routes
-by keyword overlap between the record context and the option descriptions —
-enough to exercise the full compiled code path (route -> threshold ->
-dispatch) without the heavyweight extras.
+The compiled local artifact imports the Julia decision package at module
+scope, so these tests install a minimal pure-Python fake of the ``julia``
+module that routes by keyword overlap between the record state and the
+option descriptions — enough to exercise the full compiled code path
+(route -> threshold -> dispatch) without the real 550MB checkpoint.
 """
 
 import importlib.util
@@ -66,118 +66,54 @@ class ExplodingLLM:
 
 
 # --------------------------------------------------------------------- #
-# Fake torch / transformers: keyword-overlap router                      #
+# Fake julia package: keyword-overlap decision engine                    #
 # --------------------------------------------------------------------- #
 
 
-class _Vec:
-    def __init__(self, values):
-        self.values = list(values)
-
-    def __getitem__(self, index):
-        if isinstance(index, tuple):  # logits[0, -1, :]
-            return self
-        if isinstance(index, list):  # logits[option_token_ids]
-            return _Vec([self.values[i] for i in index])
-        return self.values[index]
-
-    def __float__(self):
-        return float(self.values[0])
-
-
-class _Argmax:
-    def __init__(self, index):
-        self.index = index
-
-    def item(self):
-        return self.index
-
-
-def _build_fake_torch():
-    torch_mod = types.ModuleType("torch")
-    torch_mod.device = lambda name: name
-
-    class _NoGrad:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    torch_mod.no_grad = _NoGrad
-
-    def softmax(vec, dim=-1):
-        exps = [math.exp(v) for v in vec.values]
-        total = sum(exps)
-        return _Vec([e / total for e in exps])
-
-    torch_mod.softmax = softmax
-    torch_mod.argmax = lambda vec: _Argmax(
-        max(range(len(vec.values)), key=lambda i: vec.values[i])
-    )
-    return torch_mod
-
-
-def _keyword_scores(prompt):
-    """Score each numbered option by word overlap with the Context line."""
-    context = prompt.split("Context: ", 1)[1].split("\nQuestion:", 1)[0].lower()
-    options_blob = prompt.split("Options: ", 1)[1].split("\nAnswer:", 1)[0]
+def _keyword_scores(state, options):
+    """Score each option by word overlap with the serialized record state."""
     import re
 
-    option_texts = re.split(r"\(\d+\)\s*", options_blob)[1:]
-    context_words = set(re.findall(r"[a-z]+", context))
-    scores = []
-    for text in option_texts:
-        words = set(re.findall(r"[a-z]+", text.lower()))
-        scores.append(float(len(words & context_words)))
-    return scores
+    state_words = set(re.findall(r"[a-z]+", str(state).lower()))
+    return [
+        float(len(set(re.findall(r"[a-z]+", opt.lower())) & state_words))
+        for opt in options
+    ]
 
 
-def _build_fake_transformers():
-    transformers_mod = types.ModuleType("transformers")
+def _build_fake_julia():
+    """A stand-in for supersonic-julia's `julia` module: same predict contract
+    (rows of {state, question, options} -> [{index, probabilities}])."""
+    julia_mod = types.ModuleType("julia")
 
-    class _FakeTokenizer:
-        last_prompt = ""
+    class _FakeEngine:
+        def predict(self, rows=None, questions=None, state=None):
+            results = []
+            for row in rows:
+                exps = [
+                    math.exp(s * 4.0)
+                    for s in _keyword_scores(row["state"], row["options"])
+                ]
+                total = sum(exps)
+                probs = [e / total for e in exps]
+                results.append(
+                    {
+                        "index": max(range(len(probs)), key=probs.__getitem__),
+                        "probabilities": probs,
+                    }
+                )
+            return results
 
-        def __call__(self, prompt, return_tensors=None):
-            _FakeTokenizer.last_prompt = prompt
-            return {}
-
-        def encode(self, text, add_special_tokens=False):
-            return [int(text) - 1]  # option "1" -> token id 0, etc.
-
-        @classmethod
-        def from_pretrained(cls, name):
-            return cls()
-
-    class _FakeOutput:
-        def __init__(self, logits):
-            self.logits = logits
-
-    class _FakeModel:
-        def to(self, device):
-            return self
-
-        def eval(self):
-            return self
-
-        def __call__(self, **inputs):
-            scores = _keyword_scores(_FakeTokenizer.last_prompt)
-            return _FakeOutput(_Vec([s * 4.0 for s in scores]))
-
-        @classmethod
-        def from_pretrained(cls, name):
-            return cls()
-
-    transformers_mod.AutoTokenizer = _FakeTokenizer
-    transformers_mod.AutoModelForCausalLM = _FakeModel
-    return transformers_mod
+    julia_mod.load_model = lambda checkpoint, device="cpu", **kwargs: _FakeEngine()
+    return julia_mod
 
 
 @pytest.fixture
-def fake_runtime(monkeypatch):
-    monkeypatch.setitem(sys.modules, "torch", _build_fake_torch())
-    monkeypatch.setitem(sys.modules, "transformers", _build_fake_transformers())
+def fake_runtime(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "julia", _build_fake_julia())
+    # Point checkpoint resolution at a local dir so the artifact never tries
+    # a Hugging Face download during tests.
+    monkeypatch.setenv("STROT_NLU_CHECKPOINT", str(tmp_path))
     # Each test loads a freshly compiled artifact under a key-derived module
     # name; drop any compiled modules cached by earlier tests.
     for name in [n for n in sys.modules if n.startswith("strot_compiled_")]:

@@ -3,12 +3,12 @@
 Two completely distinct runtime implementations are supported, selected by
 the ``nlu_model`` string:
 
-* **Implementation Alpha** — :class:`LocalEncoderStrategy`: a local
-  transformer (default ``SupersonicLabs/Julia-1``) executed on CPU, scoring
-  all options in a single forward pass over the logits. When the action
-  registry exceeds :data:`MAX_FLAT_OPTIONS` choices, an Option Tree Splitter
-  decomposes the decision into a multi-tier hierarchy (Julia-1 accuracy
-  degrades beyond 20 options).
+* **Implementation Alpha** — :class:`LocalEncoderStrategy`: a local Julia
+  decision model (default ``SupersonicLabs/Julia-1``) executed on CPU via its
+  native ``julia.load_model`` / ``engine.predict`` API, scoring all options
+  in one in-process forward pass. When the action registry exceeds
+  :data:`MAX_FLAT_OPTIONS` choices, an Option Tree Splitter decomposes the
+  decision into a multi-tier hierarchy (Julia accepts 2-20 options per call).
 
 * **Implementation Beta** — :class:`HostedApiStrategy`: an ultra-lightweight
   cloud call that never imports ``torch``/``transformers``, authenticates via
@@ -81,52 +81,62 @@ def chunk_options(options: Sequence[str], max_flat: int = MAX_FLAT_OPTIONS) -> L
 
 
 class LocalEncoderStrategy(RuntimeStrategy):
-    """Implementation Alpha: local transformer on CPU, single forward pass.
+    """Implementation Alpha: local Julia decision model on CPU.
 
-    The prompt follows the Julia-1 token format::
+    Julia (``SupersonicLabs/Julia-1``) is a 144M-parameter decision model: it
+    takes a state, a question, and 2-20 rendered options and returns the
+    selected index with a probability per option, in one in-process forward
+    pass — no network, no API key, no telemetry.
 
-        Context: <serialized record>
-        Question: <dynamic selection question>
-        Options: <numbered choices>
-        Answer:
-
-    The model is run once; the logits of the final position are gathered at
-    the token ids of each option number and softmaxed, yielding a calibrated
-    distribution over options in <40 ms on commodity CPUs.
+    The model is NOT a Hugging Face Transformers AutoModel; it ships its own
+    inference package (``supersonic-julia``) inside the checkpoint repository.
     """
 
     def __init__(self, nlu_model: str = DEFAULT_NLU_MODEL, max_flat_options: int = MAX_FLAT_OPTIONS) -> None:
         self.nlu_model = nlu_model
         self.max_flat_options = max_flat_options
-        self._tokenizer: Any = None
-        self._model: Any = None
-        self._torch: Any = None
+        self._engine: Any = None
+
+    def _resolve_checkpoint(self) -> str:
+        """Local checkpoint dir: env override > local path > HF download."""
+        override = os.environ.get("STROT_NLU_CHECKPOINT")
+        if override:
+            return override
+        from pathlib import Path
+
+        if Path(self.nlu_model).is_dir():
+            return self.nlu_model
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(self.nlu_model)
 
     def _ensure_loaded(self) -> None:
-        if self._model is not None:
+        if self._engine is not None:
             return
         try:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from julia import load_model
         except ImportError as exc:
             raise RouterConfigurationError(
-                f"Local runtime for {self.nlu_model!r} requires the 'local' extra: "
-                "pip install strot-ai[local]"
+                f"Local runtime for {self.nlu_model!r} needs the 'supersonic-julia' "
+                "package, distributed inside the model repository (do NOT "
+                "`pip install julia` — that is an unrelated package). Install:\n"
+                "  pip install strot-ai[local]\n"
+                f"  python -c \"from huggingface_hub import snapshot_download; "
+                f"snapshot_download('{self.nlu_model}', local_dir='Julia-1')\"\n"
+                "  pip install ./Julia-1"
             ) from exc
-        self._torch = torch
-        device = torch.device("cpu")  # Julia-1 is sized for standard CPUs.
-        self._tokenizer = AutoTokenizer.from_pretrained(self.nlu_model)
-        self._model = AutoModelForCausalLM.from_pretrained(self.nlu_model).to(device).eval()
+        self._engine = load_model(self._resolve_checkpoint(), device="cpu")
 
     @staticmethod
-    def format_prompt(context: str, question: str, options: Sequence[str]) -> str:
-        """Render the Julia-1 specific token format."""
-        numbered = " ".join(f"({i + 1}) {opt}" for i, opt in enumerate(options))
-        return f"Context: {context}\nQuestion: {question}\nOptions: {numbered}\nAnswer:"
+    def build_row(context: str, question: str, options: Sequence[str]) -> Dict[str, Any]:
+        """Render one Julia decision row: state + question + rendered options."""
+        return {"state": context, "question": question, "options": list(options)}
 
     def select(self, context: str, question: str, options: Sequence[str]) -> RouteDecision:
         if not options:
             raise RouterConfigurationError("Cannot route with an empty option list.")
+        if len(options) == 1:  # Julia requires 2-20 options; a registry of one is trivial
+            return RouteDecision(0, options[0], 1.0, {options[0]: 1.0})
         if len(options) <= self.max_flat_options:
             return self._select_flat(context, question, options)
         return self._select_hierarchical(context, question, options)
@@ -151,23 +161,14 @@ class LocalEncoderStrategy(RuntimeStrategy):
 
     def _select_flat(self, context: str, question: str, options: Sequence[str]) -> RouteDecision:
         self._ensure_loaded()
-        torch = self._torch
-        prompt = self.format_prompt(context, question, options)
-        inputs = self._tokenizer(prompt, return_tensors="pt")
-        with torch.no_grad():
-            logits = self._model(**inputs).logits[0, -1, :]  # single forward pass
-        option_token_ids = [
-            self._tokenizer.encode(str(i + 1), add_special_tokens=False)[0]
-            for i in range(len(options))
-        ]
-        probs = torch.softmax(logits[option_token_ids], dim=-1)
-        winner = int(torch.argmax(probs).item())
-        distribution = {opt: float(probs[i]) for i, opt in enumerate(options)}
+        result = self._engine.predict(rows=[self.build_row(context, question, options)])[0]
+        index = int(result["index"])
+        probs = [float(p) for p in result["probabilities"]]
         return RouteDecision(
-            index=winner,
-            option=options[winner],
-            confidence=float(probs[winner]),
-            distribution=distribution,
+            index=index,
+            option=options[index],
+            confidence=probs[index],
+            distribution=dict(zip(options, probs)),
         )
 
 

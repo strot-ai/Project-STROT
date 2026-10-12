@@ -226,7 +226,7 @@ class StrotCompiler:
                 "",
                 "Rules: pure standard library only; comprehensive exception "
                 "handling inside each function; full type hints; no I/O, no "
-                "network calls, no imports of torch/transformers/openai; "
+                "network calls, no imports of torch/transformers/openai/julia; "
                 "return a JSON-serializable dict.",
             ]
         )
@@ -280,7 +280,7 @@ class StrotCompiler:
         missing = [name for name in expected_functions if name not in defined]
         if missing:
             return f"Missing required function definitions: {', '.join(missing)}"
-        forbidden = {"torch", "transformers", "openai"}
+        forbidden = {"torch", "transformers", "openai", "julia", "huggingface_hub"}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 names = {alias.name.split(".")[0] for alias in node.names}

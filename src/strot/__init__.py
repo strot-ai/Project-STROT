@@ -38,10 +38,12 @@ from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_sche
 __version__ = "0.2.0"
 
 from .jit import RunResult, run  # noqa: E402  (needs __version__ for cache keys)
+from .prefetch import prefetch_nlu  # noqa: E402
 
 __all__ = [
     "run",
     "RunResult",
+    "prefetch_nlu",
     "CompiledAsset",
     "StrotCompiler",
     "openai_llm_client",

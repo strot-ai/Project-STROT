@@ -54,27 +54,41 @@ class RouteDecision:
 '''
 
 LOCAL_RUNTIME_TEMPLATE = '''\
-# --- Runtime architecture: Implementation Alpha (local CPU transformer) ---
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# --- Runtime architecture: Implementation Alpha (local Julia decision model) ---
+# Julia is NOT a Transformers AutoModel; it ships its own inference package
+# ("supersonic-julia") inside the checkpoint repository.
+try:
+    from julia import load_model
+except ImportError as _exc:  # pragma: no cover - environment guard
+    raise RuntimeError(
+        "This compiled asset routes locally with {nlu_model} and needs the "
+        "'supersonic-julia' package (do NOT `pip install julia` - that is an "
+        "unrelated package). Install:\\n"
+        "  python -c \\"from huggingface_hub import snapshot_download; "
+        "snapshot_download('{nlu_model}', local_dir='Julia-1')\\"\\n"
+        "  pip install ./Julia-1"
+    ) from _exc
 
 
 class _RuntimeRouter:
-    """Single-forward-pass logit router over {nlu_model} on CPU."""
+    """Resident Julia decision engine over {nlu_model} on CPU."""
 
     def __init__(self) -> None:
-        device = torch.device("cpu")
-        self._tokenizer = AutoTokenizer.from_pretrained(NLU_MODEL)
-        self._model = AutoModelForCausalLM.from_pretrained(NLU_MODEL).to(device).eval()
+        checkpoint = os.environ.get("STROT_NLU_CHECKPOINT")
+        if checkpoint is None:
+            from pathlib import Path
 
-    @staticmethod
-    def _format_prompt(context: str, question: str, options: Sequence[str]) -> str:
-        numbered = " ".join("({{0}}) {{1}}".format(i + 1, opt) for i, opt in enumerate(options))
-        return "Context: {{0}}\\nQuestion: {{1}}\\nOptions: {{2}}\\nAnswer:".format(
-            context, question, numbered
-        )
+            if Path(NLU_MODEL).is_dir():
+                checkpoint = NLU_MODEL
+            else:
+                from huggingface_hub import snapshot_download
+
+                checkpoint = snapshot_download(NLU_MODEL)
+        self._engine = load_model(checkpoint, device="cpu")
 
     def select(self, context: str, question: str, options: Sequence[str]) -> RouteDecision:
+        if len(options) == 1:  # Julia accepts 2-20 options; one action is trivial
+            return RouteDecision(0, options[0], 1.0, {{options[0]: 1.0}})
         if len(options) <= MAX_FLAT_OPTIONS:
             return self._select_flat(context, question, options)
         return self._select_hierarchical(context, question, options)
@@ -106,21 +120,16 @@ class _RuntimeRouter:
         )
 
     def _select_flat(self, context: str, question: str, options: Sequence[str]) -> RouteDecision:
-        prompt = self._format_prompt(context, question, options)
-        inputs = self._tokenizer(prompt, return_tensors="pt")
-        with torch.no_grad():
-            logits = self._model(**inputs).logits[0, -1, :]  # single forward pass
-        option_token_ids = [
-            self._tokenizer.encode(str(i + 1), add_special_tokens=False)[0]
-            for i in range(len(options))
-        ]
-        probs = torch.softmax(logits[option_token_ids], dim=-1)
-        winner = int(torch.argmax(probs).item())
+        result = self._engine.predict(
+            rows=[{{"state": context, "question": question, "options": list(options)}}]
+        )[0]
+        index = int(result["index"])
+        probs = [float(p) for p in result["probabilities"]]
         return RouteDecision(
-            index=winner,
-            option=options[winner],
-            confidence=float(probs[winner]),
-            distribution={{opt: float(probs[i]) for i, opt in enumerate(options)}},
+            index=index,
+            option=options[index],
+            confidence=probs[index],
+            distribution=dict(zip(options, probs)),
         )
 '''
 

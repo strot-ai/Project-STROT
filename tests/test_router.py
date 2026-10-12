@@ -57,10 +57,15 @@ class TestOptionTreeSplitter:
         assert decision.confidence == pytest.approx(0.81)  # product of two tiers
 
 
-class TestJulia1PromptFormat:
-    def test_token_format_matches_spec(self):
-        prompt = LocalEncoderStrategy.format_prompt("ctx", "which?", ["a", "b"])
-        assert prompt == "Context: ctx\nQuestion: which?\nOptions: (1) a (2) b\nAnswer:"
+class TestJulia1RowFormat:
+    def test_row_matches_julia_decision_schema(self):
+        row = LocalEncoderStrategy.build_row("ctx", "which?", ["a", "b"])
+        assert row == {"state": "ctx", "question": "which?", "options": ["a", "b"]}
+
+    def test_single_option_short_circuits_without_engine(self):
+        decision = LocalEncoderStrategy().select("ctx", "which?", ["only"])
+        assert decision.index == 0
+        assert decision.confidence == 1.0
 
 
 class _FakeCompletions:
