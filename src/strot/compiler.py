@@ -231,6 +231,34 @@ class StrotCompiler:
             ]
         )
 
+    def build_research_prompt(self, schema: DatasetSchema, goal: str) -> str:
+        """Construct the synthesizer prompt for research (analysis) mode."""
+        return "\n".join(
+            [
+                "You are the STROT synthesizer. Generate production Python "
+                "analysis code.",
+                "",
+                "## VERIFIED DATASET SCHEMA",
+                schema.to_json(),
+                "",
+                "## RESEARCH GOAL",
+                goal,
+                "",
+                "## OUTPUT CONTRACT",
+                "Emit exactly one ```python code block containing a single "
+                "top-level function, fully implemented against the schema above:",
+                "- `def analyze(records: list) -> dict:` computes the goal's "
+                "insights over the full record list.",
+                "",
+                "Rules: pure standard library only (statistics, math, collections "
+                "are fine); robust to missing/None values; full type hints; no "
+                "I/O, no network calls, no imports of torch/transformers/openai/"
+                "julia; every value in the returned dict must be computed from "
+                "the records (never invented) and JSON-serializable; descriptive "
+                "snake_case keys.",
+            ]
+        )
+
     # ------------------------------------------------------------------ #
     # Phase 3: feedback-driven synthesis with self-correction             #
     # ------------------------------------------------------------------ #
@@ -356,6 +384,46 @@ class StrotCompiler:
             source=source,
             nlu_model=self.nlu_model,
             runtime_kind=self.runtime_kind,
+            goal=goal,
+            schema=schema,
+            attempts=attempts,
+        )
+
+    def compile_research(self, sample: Any, goal: str) -> CompiledAsset:
+        """Research mode: synthesize a model-free analysis asset.
+
+        No action registry, no router, no runtime model - the LLM writes
+        ``analyze(records) -> dict`` once against the verified schema, and
+        every number the asset ever outputs is computed by that code.
+        """
+        schema = introspect_schema(sample)
+        prompt = self.build_research_prompt(schema, goal)
+        generated, attempts = self._synthesize_paths(prompt, ["analyze"])
+        source = (
+            "\n\n".join(
+                [
+                    templates.RESEARCH_HEADER_TEMPLATE.format(
+                        goal=goal, schema_literal=repr(schema.to_dict())
+                    ),
+                    templates.RESEARCH_FOOTER_TEMPLATE.format(
+                        generated_paths=generated
+                    ),
+                ]
+            )
+            + "\n"
+        )
+        try:
+            ast.parse(source)
+        except SyntaxError as exc:  # template regression guard
+            raise CompilationError(
+                f"Assembled research asset failed final syntax validation: {exc}",
+                attempts=attempts,
+                last_error=str(exc),
+            ) from exc
+        return CompiledAsset(
+            source=source,
+            nlu_model="none",
+            runtime_kind="research",
             goal=goal,
             schema=schema,
             attempts=attempts,

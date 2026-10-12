@@ -56,8 +56,17 @@ class RunResult:
     cache_key: str
     pipeline: Any = None  #: live CompiledPipeline for streaming further records
     attempts: int = 0  #: synthesizer attempts (0 on a cache hit)
+    mode: str = "decision"
+    analysis: Optional[Dict[str, Any]] = None  #: research-mode computed insights
 
     def summary(self) -> Dict[str, Any]:
+        if self.mode == "research":
+            return {
+                "mode": "research",
+                "insight_keys": list(self.analysis or {}),
+                "cache_hit": self.cache_hit,
+                "artifact": str(self.artifact_path),
+            }
         per_action: Dict[str, int] = {}
         for outcome in self.outcomes:
             per_action[outcome["action"]] = per_action.get(outcome["action"], 0) + 1
@@ -116,18 +125,20 @@ def schema_fingerprint(schema: DatasetSchema) -> List[List[str]]:
 
 def cache_key(
     query: str,
-    action_registry: Mapping[str, str],
+    action_registry: Optional[Mapping[str, str]],
     nlu: str,
     schema: DatasetSchema,
     question: Optional[str],
     confidence_threshold: float,
+    mode: str = "decision",
 ) -> str:
     from . import __version__
 
     payload = {
         "strot": __version__,
+        "mode": mode,
         "query": query,
-        "registry": list(action_registry.items()),
+        "registry": list(action_registry.items()) if action_registry else [],
         "nlu": nlu,
         "question": question,
         "threshold": confidence_threshold,
@@ -186,7 +197,7 @@ def _load_artifact(path: Path, key: str) -> Any:
 def run(
     data: Any,
     query: str,
-    action_registry: Mapping[str, str],
+    action_registry: Optional[Mapping[str, str]] = None,
     llm: LLMSpec = "openai/gpt-4o",
     nlu: str = DEFAULT_NLU_MODEL,
     state: Union[str, Path] = ".strot",
@@ -195,32 +206,63 @@ def run(
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     question: Optional[str] = None,
     execute: bool = True,
+    mode: str = "decision",
 ) -> RunResult:
     """Process ``data`` against ``query``, JIT-compiling the pipeline on first use.
+
+    Two modes, one philosophy — the LLM is confined to compile time:
+
+    * ``mode="decision"`` — per-record typed decisions. The final arbiter at
+      runtime is the ML decision model (``nlu``): output is bounded,
+      type-safe JSON (action, probabilities, confidence) with the compiled
+      handlers executing the chosen path. Requires ``action_registry``.
+    * ``mode="research"`` — the LLM synthesizes analysis code against the
+      schema once; execution is model-free and every value in
+      ``result.analysis`` is computed from the records, never generated.
 
     Args:
         data: The dataset — DataFrame-like, list of dict records, or dict of
             column lists. The first ``sample_size`` records also serve as the
             synthesis/validation sample on a cache miss.
         query: The functional goal in natural language (the paper's ``goal``).
-        action_registry: Ordered mapping of action key -> description; defines
-            the routing decision space enforced on the NLU model.
+        action_registry: Decision mode only — ordered mapping of action key ->
+            description; defines the decision space enforced on the NLU model.
         llm: Synthesizer spec or callable; resolved lazily, only on cache miss.
-        nlu: Runtime router model baked into the artifact (local or hosted).
+        nlu: Decision mode only — runtime decision model baked into the asset.
         state: Artifact-store directory — the persisted "compiled flag + code".
         sample_size: Records used for schema profiling and synthesis grounding.
         max_retries: Feedback-driven synthesis budget on a cache miss.
-        confidence_threshold: Routing confidence below this raises the
-            compiled asset's FallbackException instead of executing a path.
+        confidence_threshold: Decision mode — routing confidence below this
+            raises the compiled asset's FallbackException instead of executing.
         question: Optional override of the routing question baked into the asset.
         execute: If False, only ensure the artifact exists (warm the cache)
             without loading the runtime — useful on boxes without the runtime
             extras installed.
+        mode: ``"decision"`` (default) or ``"research"``.
     """
+    if mode not in ("decision", "research"):
+        raise RouterConfigurationError(
+            f"mode must be 'decision' or 'research', got {mode!r}."
+        )
+    if mode == "decision" and not action_registry:
+        raise RouterConfigurationError(
+            "mode='decision' requires an action_registry (the bounded decision "
+            "space enforced on the ML decision model)."
+        )
+    if mode == "research" and action_registry:
+        raise RouterConfigurationError(
+            "mode='research' takes no action_registry; the compiled analysis "
+            "has no routing decision."
+        )
+
     records = as_records(data)
     sample = records[:sample_size]
     schema = introspect_schema(sample)
-    key = cache_key(query, action_registry, nlu, schema, question, confidence_threshold)
+    effective_nlu = nlu if mode == "decision" else "none"
+    key = cache_key(
+        query, action_registry, effective_nlu, schema, question,
+        confidence_threshold, mode,
+    )
     artifact_path, meta_path = _artifact_paths(state, key)
 
     cache_hit = artifact_path.exists()
@@ -232,12 +274,15 @@ def run(
             max_retries=max_retries,
             confidence_threshold=confidence_threshold,
         )
-        asset: CompiledAsset = compiler.compile(
-            sample=sample,
-            goal=query,
-            action_registry=action_registry,
-            question=question,
-        )
+        if mode == "research":
+            asset: CompiledAsset = compiler.compile_research(sample=sample, goal=query)
+        else:
+            asset = compiler.compile(
+                sample=sample,
+                goal=query,
+                action_registry=action_registry,
+                question=question,
+            )
         attempts = asset.attempts
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         asset.save(artifact_path)
@@ -245,11 +290,12 @@ def run(
             json.dumps(
                 {
                     "cache_key": key,
+                    "mode": mode,
                     "query": query,
-                    "nlu": nlu,
+                    "nlu": effective_nlu,
                     "runtime_kind": asset.runtime_kind,
                     "attempts": asset.attempts,
-                    "action_registry": dict(action_registry),
+                    "action_registry": dict(action_registry or {}),
                     "schema": schema_fingerprint(schema),
                 },
                 indent=2,
@@ -264,11 +310,17 @@ def run(
         cache_hit=cache_hit,
         cache_key=key,
         attempts=attempts,
+        mode=mode,
     )
     if not execute:
         return result
 
     module = _load_artifact(artifact_path, key)
+    if mode == "research":
+        result.pipeline = module.CompiledAnalysis()
+        result.analysis = result.pipeline.process(records)
+        return result
+
     result.pipeline = module.CompiledPipeline()
     for index, record in enumerate(records):
         try:

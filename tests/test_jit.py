@@ -272,6 +272,64 @@ def execute_lifecycle(record: dict) -> dict:
         with pytest.raises(RouterConfigurationError):
             strot.run(SAMPLE, QUERY, REGISTRY, llm=12345, state=tmp_path)
 
+    def test_research_mode_computes_analysis_without_runtime_model(self, tmp_path):
+        analysis_code = '''```python
+import statistics
+
+
+def analyze(records: list) -> dict:
+    tiers = [r.get("tier") for r in records if r.get("tier")]
+    ids = [r["ticket_id"] for r in records if isinstance(r.get("ticket_id"), int)]
+    return {
+        "ticket_count": len(records),
+        "mean_ticket_id": statistics.mean(ids) if ids else None,
+        "tiers": sorted(set(tiers)),
+    }
+```'''
+        llm = ScriptedLLM([analysis_code])
+        result = strot.run(SAMPLE, QUERY, llm=llm, state=tmp_path, mode="research")
+        assert llm.calls == 1
+        assert result.mode == "research"
+        assert result.analysis == {
+            "ticket_count": 2,
+            "mean_ticket_id": 1.5,
+            "tiers": ["free", "pro"],
+        }
+        assert result.summary()["mode"] == "research"
+        # Warm call: no LLM, no model runtime, identical computed output.
+        warm = strot.run(SAMPLE, QUERY, llm=ExplodingLLM(), state=tmp_path, mode="research")
+        assert warm.cache_hit is True
+        assert warm.analysis == result.analysis
+
+    def test_mode_is_part_of_the_cache_key(self, tmp_path, fake_runtime):
+        decision = strot.run(
+            SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path
+        )
+        research = strot.run(
+            SAMPLE,
+            QUERY,
+            llm=ScriptedLLM(
+                ["```python\ndef analyze(records: list) -> dict:\n    return {}\n```"]
+            ),
+            state=tmp_path,
+            mode="research",
+        )
+        assert decision.cache_key != research.cache_key
+
+    def test_decision_mode_requires_registry(self, tmp_path):
+        with pytest.raises(RouterConfigurationError, match="action_registry"):
+            strot.run(SAMPLE, QUERY, llm=ExplodingLLM(), state=tmp_path)
+
+    def test_research_mode_rejects_registry(self, tmp_path):
+        with pytest.raises(RouterConfigurationError, match="research"):
+            strot.run(
+                SAMPLE, QUERY, REGISTRY, llm=ExplodingLLM(), state=tmp_path, mode="research"
+            )
+
+    def test_unknown_mode_rejected(self, tmp_path):
+        with pytest.raises(RouterConfigurationError, match="mode"):
+            strot.run(SAMPLE, QUERY, REGISTRY, llm=ExplodingLLM(), state=tmp_path, mode="chat")
+
     def test_anthropic_spec_requires_extra_when_missing(self, tmp_path):
         if importlib.util.find_spec("anthropic") is not None:
             pytest.skip("anthropic installed; factory would construct a real client")
