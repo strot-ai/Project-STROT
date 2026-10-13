@@ -1,135 +1,133 @@
-# Project STROT (`strot-ai`)
+# STROT
 
-[![PyPI](https://img.shields.io/pypi/v/strot-ai)](https://pypi.org/project/strot-ai/)
-[![Python](https://img.shields.io/pypi/pyversions/strot-ai)](https://pypi.org/project/strot-ai/)
-[![License](https://img.shields.io/pypi/l/strot-ai)](LICENSE)
-
-**Compile-time LLM code synthesis, deterministic runtime routing.**
-
-An open-source implementation of the [STROT framework](https://arxiv.org/abs/2505.01636)
-(*Structured Task Reasoning and Output Transformation*) extended with an NLU
-strategy-pattern runtime: a large generative LLM scaffolds your execution
-paths **once at compile time**, and a small, fast NLU model routes every
-record **deterministically at runtime** — baked into a single standalone
-Python file.
+**The open decision system.** Compile your intent once with an LLM. Then decide on every record forever — classification, scoring, routing — as type-safe JSON with probabilities, confidence, and a fitted statistical guarantee, on your own hardware, at zero marginal cost.
 
 ```
-┌──────────────────────── COMPILE TIME ────────────────────────┐
-│ dataset sample ─▶ schema introspection (Phase 1)             │
-│                ─▶ prompt scaffolding   (Phase 2)             │
-│                ─▶ LLM code synthesis + self-correction loop  │
-│                   (Phase 3, bounded retries on error traces) │
-│                ─▶ compiled_pipeline.py  (standalone asset)   │
-└──────────────────────────────────────────────────────────────┘
-┌───────────────────────── RUNTIME ────────────────────────────┐
-│ record ─▶ NLU router (local CPU transformer OR hosted API)   │
-│        ─▶ confidence >= 0.40 ? dispatch : FallbackException  │
-│        ─▶ statically compiled execution path                 │
-└──────────────────────────────────────────────────────────────┘
+STROT = Agentic Schema Intent + Compiler Creation & State + Code + Execution + NLU
+      ⟹ JSON Decisions (classification · scoring · routing)
 ```
 
-## Installation
+Agents at compile time. **Never at runtime.**
 
 ```bash
-pip install strot-ai            # core (pure stdlib)
-pip install strot-ai[local]     # + torch/transformers for local NLU
-pip install strot-ai[hosted]    # + openai for hosted NLU / synthesis
+pip install strot-ai
 ```
 
-## Quick start
+## How it works
+
+```
+                    COMPILE (once per intent + schema)
+  intent + sample ──▶ agent synthesizes config ──▶ golden gate ──▶ teacher labels
+                                                   (your known      (LLM annotates
+                                                    answers must     your real sample,
+                                                    pass)            once)
+                      ──▶ calibration fitted ──▶ frozen artifact (.py)
+                          (temperature +
+                           conformal threshold)
+
+                    RUNTIME (every record, forever)
+  record ──▶ projection ──▶ local decision model ──▶ conformal gate ──▶ typed JSON
+             (compiled)     (144M, CPU, ~60ms)       (dispatch or        decision
+                                                      abstain)
+```
+
+The LLM runs **once**, at compile time. Production is a frozen, self-contained Python artifact: a small local decision model arbitrates every record, nothing is ever generated, every output is bounded, and low-confidence records abstain instead of guessing.
+
+## Decide: typed questions over records
 
 ```python
-from strot import StrotCompiler
-from strot.compiler import openai_llm_client
+import strot
 
-tickets = [
-    {"ticket_id": 101, "channel": "email", "body": "I was double charged"},
-    {"ticket_id": 102, "channel": "chat",  "body": "App crashes on export"},
-]
-
-compiler = StrotCompiler(
-    nlu_model="SupersonicLabs/Julia-1",     # default: local, CPU, Apache-2.0
-    llm_client=openai_llm_client("gpt-4o"), # the compile-time synthesizer
+result = strot.decide(
+    records,
+    questions={
+        "is_bug_report": {"type": "boolean",
+            "instructions": "Does this mention malfunctions, errors, or crashes?"},
+        "customer_sentiment": {"type": "score", "min": 1, "max": 5,
+            "instructions": "1 is furious, 5 is delighted."},
+        "routing_bucket": {"type": "choice",
+            "options": ["billing_team", "engineering_team", "product_feedback", "spam"]},
+    },
+    llm="anthropic/claude-opus-4-8",   # used once, on cache miss only
 )
 
-asset = compiler.compile(
-    sample=tickets,
-    goal="Triage incoming support tickets into the correct workflow.",
+result.outcomes[0]["decision"]
+# {"booleans": {"is_bug_report": {"type": "boolean", "probability": 0.9998}},
+#  "scores":   {"customer_sentiment": {"value": 1.79, "confidence": 0.899}},
+#  "choices":  {"routing_bucket": {"selected": "engineering_team",
+#               "probabilities": {...}, "confidence": 0.9992}}}
+```
+
+## Run: route and dispatch, with a guarantee
+
+```python
+result = strot.run(
+    tickets,
+    query="Triage incoming support tickets into the correct resolution workflow.",
     action_registry={
         "billing_dispute":  "Refunds, invoice corrections, double charges",
         "technical_defect": "Crashes, bugs, broken behavior",
+        "account_lifecycle": "Deletion, data export, GDPR requests",
     },
+    llm="anthropic/claude-opus-4-8",
+    golden=[  # promotion gate: artifacts must pass your known answers
+        {"record": {"body": "I was double charged"}, "expect": "billing_dispute"},
+    ],
+    target_risk=0.1,  # fitted guarantee: ≤10% of dispatched decisions wrong, or abstain
 )
-asset.save("compiled_pipeline.py")          # completely self-contained
+
+result.summary()
+# {"processed": 13, "fallbacks": 1, "actions": {...}, "cache_hit": False, ...}
 ```
 
-Then, anywhere in production (no `strot` dependency required):
+The first call compiles (seconds, cents). Every later call — and every restart sharing the `state` directory — is a cache hit: no LLM, no API key, pure execution.
 
-```python
-from compiled_pipeline import CompiledPipeline, FallbackException
+## Measured
 
-pipeline = CompiledPipeline()
-try:
-    outcome = pipeline.process({"ticket_id": 7, "body": "charged twice"})
-    print(outcome)  # {"action": "billing_dispute", "confidence": 0.93, "result": {...}}
-except FallbackException as exc:
-    quarantine(exc)  # confidence < 0.40 — never execute a random path
-```
+Real model (SupersonicLabs/Julia-1, 144M, CPU), real datasets, clean Docker containers:
 
-See [`examples/end_to_end.py`](examples/end_to_end.py) for the full
-walkthrough (it also runs offline with a stub synthesizer).
+| Metric | Result |
+|---|---|
+| Grounded routing accuracy (398 records, ground truth) | **92.5%** compiled (74.8% naive — the compiler is worth +18pp on the same model) |
+| Hand-tuned ceiling, same model | 100% |
+| Typed decisions vs the leading hosted decision API's own example | near-identical (score 1.79 vs 1.8) |
+| Calibrated dispatch (α=0.15, 14 records) | 13 dispatched, all correct; 1 ambiguous record abstained under the guarantee |
+| Latency | ~60 ms/record, CPU, in-process |
+| Marginal cost per decision | $0 |
+| LLM calls per runtime record | 0 |
 
-## The two runtime architectures
-
-The `nlu_model` string selects which runtime gets compiled into the asset:
-
-**Implementation Alpha — local encoder** (default `SupersonicLabs/Julia-1`).
-Loads via `transformers`, forced onto `torch.device("cpu")`. Options are
-rendered in the Julia-1 token format (`Context: ...\nQuestion: ...\nOptions:
-...\nAnswer:`) and scored from the logits of a **single forward pass**
-(<40 ms on CPU). If the action registry exceeds 20 keys, an **Option Tree
-Splitter** decomposes the decision into a multi-tier hierarchy, since Julia-1
-accuracy degrades beyond 20 choices.
-
-**Implementation Beta — hosted API** (e.g. `openai/gpt-4o-mini`).
-An ultra-lightweight block: API keys from `os.environ`, **zero
-torch/transformers imports** (tiny container footprint), and Structured
-Outputs (strict JSON Schema) forcing the provider to return only the integer
-index of the winning execution path.
-
-Both runtimes enforce the same guard: if the calibrated confidence of the
-winning path is below **0.40**, the asset raises `FallbackException` instead
-of executing blindly.
-
-## API surface
-
-| Symbol | Role |
-| --- | --- |
-| `StrotCompiler` | Phase 1–3 orchestration: introspect → scaffold → synthesize → assemble |
-| `CompiledAsset` | The standalone artifact; `.save("compiled_pipeline.py")` |
-| `introspect_schema` | Schema profiler: semantic types, cardinality, null rates, samples |
-| `create_router` / `Router` | Library-side routing with confidence enforcement |
-| `LocalEncoderStrategy` / `HostedApiStrategy` | The two runtime strategies |
-| `FallbackException` | Raised when `max_probability < 0.40` |
-| `CompilationError` | Synthesis failed after the self-correction retry budget |
-
-## How the self-correction loop works
-
-Following the STROT paper's feedback-driven refinement phase, the compiler
-validates every LLM response before accepting it — syntax (`ast.parse`), the
-output contract (one `execute_<key>` function per registry entry), and an
-import blocklist (execution paths must stay stdlib-pure). On failure, the
-error trace and the rejected code are appended to the original prompt and the
-synthesizer retries, up to `max_retries` attempts, after which
-`CompilationError` is raised.
-
-## Development
+## Install
 
 ```bash
-poetry install --extras all
-poetry run pytest
+pip install strot-ai            # core: pure stdlib
+pip install strot-ai[local]     # + torch/transformers for the local decision model
+pip install strot-ai[hosted]    # + openai for a hosted decision runtime
+pip install strot-ai[anthropic] # + anthropic for the synthesizer
 ```
+
+The default local decision model (`SupersonicLabs/Julia-1`, Apache-2.0) ships its own inference package inside its Hugging Face repository. Bake it into your image at build time:
+
+```dockerfile
+RUN pip install strot-ai[local] \
+ && python -c "import strot; strot.prefetch_nlu(local_dir='/opt/julia-1', install=True)"
+ENV STROT_NLU_CHECKPOINT=/opt/julia-1
+```
+
+After that, production runs fully offline. (Never `pip install julia` — that's an unrelated package.)
+
+## What makes it different
+
+- **Compile once, decide forever** — content-addressed artifact cache; schema drift automatically triggers exactly one recompile
+- **Golden-record promotion** — a candidate artifact is executed against your known answers inside the compile loop; only passing artifacts are ever served
+- **Fitted guarantees** — temperature scaling + split conformal prediction, fitted at compile time, baked into the artifact: dispatched decisions are wrong with probability ≤ α (marginal), everything else abstains
+- **0% structural hallucination** — output is selection + computation over your registry; nothing is generated at runtime
+- **Model-independent** — the decision model is a slot (`nlu=`): local Julia-1 by default, hosted APIs, or any drop-in selector; the compiler, gates, and calibration keep their value across all of them
+- **Every compile is logged** (`episodes.jsonl`) — the dataset for future compile-policy training
+
+## Documentation
+
+See [DEVELOPERS.md](DEVELOPERS.md) for the developer guide: architecture, artifact anatomy, calibration semantics and caveats, deployment patterns, model swapping, and the API reference.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. Default decision model: Apache-2.0 ([SupersonicLabs/Julia-1](https://huggingface.co/SupersonicLabs/Julia-1)). Implements ideas from STROT (arXiv:2505.01636).
