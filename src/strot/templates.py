@@ -33,6 +33,11 @@ NLU_MODEL = {nlu_model!r}
 CONFIDENCE_THRESHOLD = {threshold}
 MAX_FLAT_OPTIONS = 20
 
+#: Fitted at compile time from teacher-labeled sample records (None = uncalibrated).
+TEMPERATURE: float = {temperature}
+CONFORMAL_Q = {conformal_q}
+CALIBRATION: Dict[str, Any] = {calibration_literal}
+
 DATASET_SCHEMA: Dict[str, Any] = {schema_literal}
 
 
@@ -356,20 +361,49 @@ class CompiledPipeline:
     ) -> Dict[str, Any]:
         context = route_context(dict(record))  # compile-time-synthesized projection
         decision = self._router.select(context, question, _ROUTING_OPTIONS)
-        if decision.confidence < CONFIDENCE_THRESHOLD:
-            raise FallbackException(
-                "Routing confidence {{0:.3f}} below threshold {{1:.2f}}; refusing to "
-                "execute a path for this record.".format(
-                    decision.confidence, CONFIDENCE_THRESHOLD
-                ),
-                confidence=decision.confidence,
-                threshold=CONFIDENCE_THRESHOLD,
-            )
-        action_key = _ACTION_KEYS[decision.index]
+        if CONFORMAL_Q is not None:
+            # Calibrated conformal dispatch: temperature-scale the distribution,
+            # form the prediction set, execute only on a singleton. Carries the
+            # split-conformal marginal guarantee fitted at compile time.
+            raw = [
+                max(decision.distribution.get(opt, 0.0), 1e-12)
+                for opt in _ROUTING_OPTIONS
+            ]
+            powered = [p ** (1.0 / TEMPERATURE) for p in raw]
+            total = sum(powered)
+            calibrated = [p / total for p in powered]
+            included = [
+                i for i, p in enumerate(calibrated) if p >= 1.0 - CONFORMAL_Q
+            ]
+            if len(included) != 1:
+                top = max(calibrated)
+                raise FallbackException(
+                    "Conformal prediction set holds {{0}} labels (needs exactly 1 "
+                    "to dispatch at alpha={{1}}); falling back.".format(
+                        len(included), CALIBRATION.get("alpha")
+                    ),
+                    confidence=top,
+                    threshold=1.0 - CONFORMAL_Q,
+                )
+            index = included[0]
+            confidence = calibrated[index]
+        else:
+            if decision.confidence < CONFIDENCE_THRESHOLD:
+                raise FallbackException(
+                    "Routing confidence {{0:.3f}} below threshold {{1:.2f}}; refusing to "
+                    "execute a path for this record.".format(
+                        decision.confidence, CONFIDENCE_THRESHOLD
+                    ),
+                    confidence=decision.confidence,
+                    threshold=CONFIDENCE_THRESHOLD,
+                )
+            index = decision.index
+            confidence = decision.confidence
+        action_key = _ACTION_KEYS[index]
         result = _HANDLERS[action_key](dict(record))
         return {{
             "action": action_key,
-            "confidence": decision.confidence,
+            "confidence": confidence,
             "result": result,
         }}
 

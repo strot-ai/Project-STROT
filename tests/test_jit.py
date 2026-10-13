@@ -351,6 +351,74 @@ class TestRun:
             strot.run(SAMPLE, QUERY, REGISTRY, llm="anthropic/claude-opus-4-8", state=tmp_path)
 
 
+class TestCalibration:
+    SAMPLE3 = SAMPLE + [{"ticket_id": 3, "body": "zzz qqq", "tier": None}]
+    TEACHER = '```python\nLABELS = ["billing", "defect", "billing"]\n```'
+
+    def test_calibrated_artifact_ships_fitted_guarantee(self, tmp_path, fake_runtime):
+        llm = ScriptedLLM([VALID_PATHS, self.TEACHER])
+        result = strot.run(
+            self.SAMPLE3, QUERY, REGISTRY, llm=llm, state=tmp_path, target_risk=0.5
+        )
+        assert llm.calls == 2  # one synthesis + one teacher labeling
+        source = result.artifact_path.read_text()
+        assert "CONFORMAL_Q = None" not in source  # fitted quantile baked in
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        calibration = meta["calibration"]
+        assert calibration["n_calibration"] == 3
+        assert calibration["alpha"] == 0.5
+        assert calibration["temperature"] > 0
+        # Clear records dispatch via singleton prediction sets...
+        routed = {o["record"]["ticket_id"]: o["action"] for o in result.outcomes}
+        assert routed == {1: "billing", 2: "defect"}
+        # ...the ambiguous record abstains (set is not a singleton).
+        assert [fb["record"]["ticket_id"] for fb in result.fallbacks] == [3]
+        assert "Conformal prediction set" in result.fallbacks[0]["reason"]
+        # Warm call: zero LLM, identical behavior.
+        warm = strot.run(
+            self.SAMPLE3, QUERY, REGISTRY, llm=ExplodingLLM(), state=tmp_path,
+            target_risk=0.5,
+        )
+        assert warm.cache_hit is True
+        assert len(warm.fallbacks) == 1
+
+    def test_target_risk_is_part_of_cache_key(self, tmp_path, fake_runtime):
+        plain = strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path)
+        calibrated = strot.run(
+            SAMPLE, QUERY, REGISTRY,
+            llm=ScriptedLLM([VALID_PATHS, '```python\nLABELS = ["billing", "defect"]\n```']),
+            state=tmp_path, target_risk=0.5,
+        )
+        assert plain.cache_key != calibrated.cache_key
+
+    def test_invalid_target_risk_rejected(self, tmp_path):
+        with pytest.raises(RouterConfigurationError, match="target_risk"):
+            strot.run(SAMPLE, QUERY, REGISTRY, llm=ExplodingLLM(), state=tmp_path, target_risk=1.5)
+
+
+class TestEpisodeLog:
+    def test_promoted_compile_logged_once(self, tmp_path, fake_runtime):
+        strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path)
+        strot.run(SAMPLE, QUERY, REGISTRY, llm=ExplodingLLM(), state=tmp_path)  # warm: no episode
+        lines = (tmp_path / "episodes.jsonl").read_text().splitlines()
+        assert len(lines) == 1
+        episode = json.loads(lines[0])
+        assert episode["kind"] == "run"
+        assert episode["status"] == "promoted"
+        assert episode["attempts"] == 1
+        assert episode["actions"] == ["billing", "defect"]
+
+    def test_failed_compile_logged(self, tmp_path, fake_runtime):
+        with pytest.raises(Exception):
+            strot.run(
+                SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM(["nonsense"]),
+                state=tmp_path, max_retries=1,
+            )
+        episode = json.loads((tmp_path / "episodes.jsonl").read_text().splitlines()[-1])
+        assert episode["status"] == "failed"
+        assert "error" in episode
+
+
 DECIDE_CONFIG = {
     "is_bug": {"type": "noul", "instructions": "Does this mention crashes or errors?"},
     "sentiment": {"type": "score", "min": 1, "max": 3,

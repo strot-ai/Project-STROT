@@ -131,6 +131,7 @@ def cache_key(
     confidence_threshold: float,
     mode: str = "decision",
     golden: Optional[Any] = None,
+    target_risk: Optional[float] = None,
 ) -> str:
     from . import __version__
 
@@ -144,6 +145,7 @@ def cache_key(
         "threshold": confidence_threshold,
         "schema": schema_fingerprint(schema),
         "golden": golden,
+        "target_risk": target_risk,
     }
     canonical = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -195,6 +197,25 @@ def _load_artifact(path: Path, key: str) -> Any:
     return module
 
 
+def _log_episode(state: Union[str, Path], payload: Dict[str, Any]) -> None:
+    """Append one compile episode to the state dir's episodes.jsonl.
+
+    Every compile - success or failure - is a (configuration, outcome) pair:
+    the raw material for future supervised/RL training of the compile step.
+    Logging is best-effort and never breaks a compile.
+    """
+    from datetime import datetime, timezone
+
+    try:
+        state_dir = Path(state)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"ts": datetime.now(timezone.utc).isoformat(), **payload}
+        with (state_dir / "episodes.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, default=str) + "\n")
+    except OSError:
+        pass
+
+
 def run(
     data: Any,
     query: str,
@@ -208,6 +229,7 @@ def run(
     question: Optional[str] = None,
     execute: bool = True,
     golden: Optional[List[Mapping[str, Any]]] = None,
+    target_risk: Optional[float] = None,
 ) -> RunResult:
     """Process ``data`` against ``query``, JIT-compiling the pipeline on first use.
 
@@ -240,6 +262,12 @@ def run(
             inside the compile repair loop; only an artifact for which every
             expectation holds is persisted and served. Requires the decision
             runtime on the compile box.
+        target_risk: Optional miscoverage level ``alpha`` (e.g. 0.05). Fits
+            temperature scaling + a split-conformal threshold from an
+            LLM-teacher-labeled sample at compile time; the artifact then
+            dispatches only on singleton prediction sets, carrying a marginal
+            guarantee that a dispatched decision is wrong with probability
+            <= alpha. Requires the decision runtime on the compile box.
     """
     if not action_registry:
         raise RouterConfigurationError(
@@ -254,7 +282,7 @@ def run(
         StrotCompiler.validate_golden_run(golden, action_registry)
     key = cache_key(
         query, action_registry, nlu, schema, question, confidence_threshold,
-        golden=golden,
+        golden=golden, target_risk=target_risk,
     )
     artifact_path, meta_path = _artifact_paths(state, key)
 
@@ -267,13 +295,29 @@ def run(
             max_retries=max_retries,
             confidence_threshold=confidence_threshold,
         )
-        asset: CompiledAsset = compiler.compile(
-            sample=sample,
-            goal=query,
-            action_registry=action_registry,
-            question=question,
-            golden=golden,
-        )
+        try:
+            asset: CompiledAsset = compiler.compile(
+                sample=sample,
+                goal=query,
+                action_registry=action_registry,
+                question=question,
+                golden=golden,
+                target_risk=target_risk,
+            )
+        except Exception as exc:
+            _log_episode(state, {
+                "kind": "run", "status": "failed", "cache_key": key,
+                "query": query, "actions": list(action_registry),
+                "golden_count": len(golden or []), "target_risk": target_risk,
+                "error": str(exc)[:500],
+            })
+            raise
+        _log_episode(state, {
+            "kind": "run", "status": "promoted", "cache_key": key,
+            "query": query, "actions": list(action_registry),
+            "golden_count": len(golden or []), "target_risk": target_risk,
+            "attempts": asset.attempts, "calibration": asset.calibration,
+        })
         attempts = asset.attempts
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         asset.save(artifact_path)
@@ -287,6 +331,7 @@ def run(
                     "attempts": asset.attempts,
                     "action_registry": dict(action_registry),
                     "schema": schema_fingerprint(schema),
+                    "calibration": asset.calibration,
                 },
                 indent=2,
             ),
@@ -384,7 +429,22 @@ def decide(
             llm_client=_resolve_llm(llm),
             max_retries=max_retries,
         )
-        asset = compiler.compile_decide(sample=sample, questions=questions, golden=golden)
+        try:
+            asset = compiler.compile_decide(
+                sample=sample, questions=questions, golden=golden
+            )
+        except Exception as exc:
+            _log_episode(state, {
+                "kind": "decide", "status": "failed", "cache_key": key,
+                "questions": list(questions), "golden_count": len(golden or []),
+                "error": str(exc)[:500],
+            })
+            raise
+        _log_episode(state, {
+            "kind": "decide", "status": "promoted", "cache_key": key,
+            "questions": list(questions), "golden_count": len(golden or []),
+            "attempts": asset.attempts,
+        })
         attempts = asset.attempts
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         asset.save(artifact_path)

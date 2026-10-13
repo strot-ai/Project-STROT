@@ -140,6 +140,18 @@ def claude_cli_llm_client(
     return _call
 
 
+def _sample_records(sample: Any) -> List[Dict[str, Any]]:
+    """Normalize any supported sample shape into a list of dict records."""
+    from .schema import SchemaProfiler
+
+    columns = SchemaProfiler()._normalize(sample)
+    length = max(len(values) for values in columns.values())
+    return [
+        {name: (values[i] if i < len(values) else None) for name, values in columns.items()}
+        for i in range(length)
+    ]
+
+
 def handler_name(action_key: str) -> str:
     """Map an action-registry key to its compiled function name."""
     sanitized = re.sub(r"\W+", "_", action_key).strip("_").lower()
@@ -158,6 +170,7 @@ class CompiledAsset:
     goal: str
     schema: DatasetSchema
     attempts: int
+    calibration: Optional[Dict[str, Any]] = None  #: fitted stats (None = uncalibrated)
 
     def save(self, path: Union[str, Path] = "compiled_pipeline.py") -> Path:
         """Persist the asset as an independent Python file."""
@@ -455,6 +468,122 @@ class StrotCompiler:
             )
         return None
 
+    # ------------------------------------------------------------------ #
+    # Compile-time calibration (teacher labels -> fitted temperature + q)  #
+    # ------------------------------------------------------------------ #
+
+    def build_teacher_prompt(
+        self,
+        goal: str,
+        action_registry: Mapping[str, str],
+        records: List[Dict[str, Any]],
+    ) -> str:
+        """Ask the synthesizer LLM to act as a labeling teacher, once."""
+        lines = [
+            "You are the STROT teacher. Label each record with the single "
+            "best action for the goal.",
+            "",
+            "## GOAL",
+            goal,
+            "",
+            "## ACTIONS",
+        ]
+        lines += [f"- {key}: {desc}" for key, desc in action_registry.items()]
+        lines += ["", "## RECORDS (one JSON object per line, in order)"]
+        lines += [
+            f"{i}: {json.dumps(record, default=str, sort_keys=True)}"
+            for i, record in enumerate(records)
+        ]
+        lines += [
+            "",
+            "## OUTPUT CONTRACT",
+            "Emit exactly one ```python code block containing ONLY one "
+            "module-level literal assignment:",
+            f"- `LABELS: List[str]` with exactly {len(records)} entries; the "
+            "i-th entry is the action key for record i, drawn only from: "
+            + ", ".join(map(repr, action_registry)) + ".",
+            "",
+            "No other statements, functions, or imports.",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _validate_teacher_labels(
+        code: str, n_records: int, action_registry: Mapping[str, str]
+    ) -> Optional[str]:
+        if not code:
+            return "The response contained no code."
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as exc:
+            return f"SyntaxError at line {exc.lineno}: {exc.msg}"
+        value_node = None
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(isinstance(x, ast.Name) and x.id == "LABELS" for x in targets):
+                    value_node = node.value
+                    continue
+            return "Emit ONLY the LABELS literal assignment."
+        if value_node is None:
+            return "Missing required module-level literal LABELS."
+        try:
+            labels = ast.literal_eval(value_node)
+        except (ValueError, SyntaxError):
+            return "LABELS must be a literal list of action-key strings."
+        if not isinstance(labels, list) or len(labels) != n_records:
+            return f"LABELS must contain exactly {n_records} entries."
+        bad = [x for x in labels if x not in action_registry]
+        if bad:
+            return f"LABELS contains unknown action keys: {bad[:5]}"
+        return None
+
+    def _fit_calibration(
+        self,
+        source: str,
+        records: List[Dict[str, Any]],
+        labels: List[str],
+        action_registry: Mapping[str, str],
+        question: Optional[str],
+        goal: str,
+        target_risk: float,
+    ) -> Dict[str, Any]:
+        """Run the promoted artifact over teacher-labeled records; fit T and q."""
+        import sys
+
+        from . import calibrate
+
+        module = self._load_candidate_module(source)
+        try:
+            router = module._RuntimeRouter()
+            action_keys = list(action_registry)
+            routing_question = question or (
+                f"Which execution path best achieves the goal: {goal}?"
+            )
+            distributions: List[List[float]] = []
+            true_indices: List[int] = []
+            for record, label in zip(records, labels):
+                context = module.route_context(dict(record))
+                decision = router.select(
+                    context, routing_question, module._ROUTING_OPTIONS
+                )
+                distributions.append(
+                    [
+                        max(decision.distribution.get(opt, 0.0), 1e-12)
+                        for opt in module._ROUTING_OPTIONS
+                    ]
+                )
+                true_indices.append(action_keys.index(label))
+        finally:
+            sys.modules.pop("strot_golden_gate", None)
+        temperature = calibrate.fit_temperature(distributions, true_indices)
+        quantile = calibrate.conformal_quantile(
+            distributions, true_indices, temperature, alpha=target_risk
+        )
+        return calibrate.calibration_report(
+            distributions, true_indices, temperature, quantile, target_risk
+        )
+
     def compile(
         self,
         sample: Any,
@@ -462,6 +591,7 @@ class StrotCompiler:
         action_registry: Mapping[str, str],
         question: Optional[str] = None,
         golden: Optional[List[Mapping[str, Any]]] = None,
+        target_risk: Optional[float] = None,
     ) -> CompiledAsset:
         """Run the full compile-time pipeline and return the production asset.
 
@@ -478,7 +608,17 @@ class StrotCompiler:
                 candidate asset is executed against them inside the repair
                 loop and only promoted if every expectation holds. Requires
                 the decision runtime on the compile box.
+            target_risk: Optional miscoverage level ``alpha`` (e.g. 0.05).
+                When set, the LLM teacher-labels the sample once, a
+                temperature and split-conformal quantile are fitted on the
+                promoted artifact's own distributions, and the artifact
+                dispatches only on singleton prediction sets - carrying the
+                marginal guarantee that a dispatched decision is wrong with
+                probability <= alpha. Requires the decision runtime on the
+                compile box.
         """
+        if target_risk is not None and not 0 < target_risk < 1:
+            raise RouterConfigurationError("target_risk must be in (0, 1).")
         if not action_registry:
             raise CompilationError("action_registry must contain at least one action.", attempts=0)
         if golden is not None:
@@ -507,10 +647,54 @@ class StrotCompiler:
                 if error:
                     return error
             promoted["source"] = source
+            promoted["code"] = code
             return None
 
         _, attempts = self._synthesize_with(prompt, validate)
         source = promoted["source"]
+
+        calibration: Optional[Dict[str, Any]] = None
+        if target_risk is not None:
+            records = _sample_records(sample)
+            teacher_prompt = self.build_teacher_prompt(goal, action_registry, records)
+            labels_code, _ = self._synthesize_with(
+                teacher_prompt,
+                lambda code: self._validate_teacher_labels(
+                    code, len(records), action_registry
+                ),
+            )
+            labels = ast.literal_eval(
+                next(
+                    node.value
+                    for node in ast.parse(labels_code).body
+                    if isinstance(node, (ast.Assign, ast.AnnAssign))
+                )
+            )
+            calibration = self._fit_calibration(
+                source, records, labels, action_registry, question, goal, target_risk
+            )
+            source = self._assemble(
+                schema,
+                goal,
+                dict(action_registry),
+                promoted["code"],
+                question,
+                temperature=float(calibration["temperature"]),
+                conformal_q=float(calibration["conformal_quantile"]),
+                calibration=calibration,
+            )
+            if golden:
+                error = self._test_golden_pipeline(source, golden)
+                if error:
+                    raise CompilationError(
+                        "Calibrated artifact no longer satisfies the golden "
+                        f"records at target_risk={target_risk} (the conformal "
+                        "gate abstains on them). Relax target_risk or revisit "
+                        f"the goldens:\n{error}",
+                        attempts=attempts,
+                        last_error=error,
+                    )
+
         return CompiledAsset(
             source=source,
             nlu_model=self.nlu_model,
@@ -518,6 +702,7 @@ class StrotCompiler:
             goal=goal,
             schema=schema,
             attempts=attempts,
+            calibration=calibration,
         )
 
     @staticmethod
@@ -826,12 +1011,18 @@ class StrotCompiler:
         action_registry: Dict[str, str],
         generated_paths: str,
         question: Optional[str],
+        temperature: float = 1.0,
+        conformal_q: Optional[float] = None,
+        calibration: Optional[Dict[str, Any]] = None,
     ) -> str:
         header = templates.ASSET_HEADER_TEMPLATE.format(
             nlu_model=self.nlu_model,
             runtime_kind=self.runtime_kind,
             goal=goal,
             threshold=self.confidence_threshold,
+            temperature=repr(temperature),
+            conformal_q=repr(conformal_q),
+            calibration_literal=repr(calibration or {}),
             schema_literal=repr(schema.to_dict()),
         )
         runtime_template = (
