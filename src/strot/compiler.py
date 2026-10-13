@@ -505,7 +505,7 @@ class StrotCompiler:
 
     @staticmethod
     def validate_questions_config(questions: Mapping[str, Any]) -> None:
-        """Validate a Jev-compatible question config before any synthesis."""
+        """Validate a typed-question config before any synthesis."""
         if not isinstance(questions, Mapping) or not questions:
             raise RouterConfigurationError("questions must be a non-empty mapping.")
         for name, spec in questions.items():
@@ -548,7 +548,7 @@ class StrotCompiler:
                     )
 
     def build_decide_prompt(self, schema: DatasetSchema, questions: Mapping[str, Any]) -> str:
-        """Construct the decide-mode prompt: expand a Jev config for the model."""
+        """Construct the decide-mode prompt: expand a typed-question config for the model."""
         return "\n".join(
             [
                 "You are the STROT synthesizer. Expand a typed-question config "
@@ -558,7 +558,7 @@ class StrotCompiler:
                 "## VERIFIED DATASET SCHEMA",
                 schema.to_json(),
                 "",
-                "## DECISION CONFIG (Jev-compatible)",
+                "## DECISION CONFIG (typed questions)",
                 json.dumps(questions, indent=2),
                 "",
                 "## OUTPUT CONTRACT",
@@ -644,7 +644,7 @@ class StrotCompiler:
         return None
 
     def compile_decide(self, sample: Any, questions: Mapping[str, Any]) -> CompiledAsset:
-        """Decide mode: compile a Jev-compatible typed-question config.
+        """Decide mode: compile a typed-question decision config.
 
         The synthesis agent expands the config (criteria descriptions, score
         rubrics, noul case descriptions) against the verified schema and

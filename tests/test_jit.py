@@ -408,7 +408,7 @@ def route_context(record: dict) -> str:
 
 
 class TestDecide:
-    def test_decide_outputs_jev_shaped_json(self, tmp_path, fake_runtime):
+    def test_decide_outputs_typed_decision_json(self, tmp_path, fake_runtime):
         llm = ScriptedLLM([VALID_DECIDE])
         result = strot.decide(SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path)
         assert llm.calls == 1
@@ -429,8 +429,8 @@ class TestDecide:
         warm = strot.decide(SAMPLE, DECIDE_CONFIG, llm=ExplodingLLM(), state=tmp_path)
         assert warm.cache_hit is True
 
-    def test_decide_accepts_full_jev_config_json_string(self, tmp_path, fake_runtime):
-        config = json.dumps({"model": "jev-latest", "state": "ignored",
+    def test_decide_accepts_full_config_json_string(self, tmp_path, fake_runtime):
+        config = json.dumps({"model": "decision-model", "state": "ignored",
                              "questions": DECIDE_CONFIG})
         result = strot.decide(SAMPLE, config, llm=ScriptedLLM([VALID_DECIDE]), state=tmp_path)
         assert len(result.outcomes) == 2

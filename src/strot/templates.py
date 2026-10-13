@@ -305,7 +305,7 @@ DECIDE_HEADER_TEMPLATE = '''\
 """Compiled STROT decision asset. DO NOT EDIT BY HAND.
 
 Synthesized by strot-ai (STROT: Structured Task Reasoning and
-Output Transformation, arXiv:2505.01636) in decide mode: a Jev-compatible
+Output Transformation, arXiv:2505.01636) in decide mode: a
 typed-question config compiled against the verified schema. Per record, the
 local decision model answers every question in one batched pass and the
 output is exclusively type-safe JSON (nouls / scores / choices with
@@ -337,7 +337,7 @@ NLU_MODEL = {nlu_model!r}
 
 DATASET_SCHEMA: Dict[str, Any] = {schema_literal}
 
-#: The original Jev-compatible question config this asset was compiled from.
+#: The original typed-question config this asset was compiled from.
 QUESTIONS_CONFIG: Dict[str, Any] = {config_literal}
 '''
 

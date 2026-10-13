@@ -355,9 +355,9 @@ def decide(
     max_retries: int = 3,
     execute: bool = True,
 ) -> RunResult:
-    """Answer a Jev-compatible typed-question config over every record.
+    """Answer a typed-question decision config over every record.
 
-    ``questions`` uses Jev's structure (a dict or JSON string; a full config
+    ``questions`` is a typed-question config (a dict or JSON string; a full config
     object with a top-level ``"questions"`` key is also accepted)::
 
         {
@@ -368,7 +368,7 @@ def decide(
                               "options": ["billing_team", "engineering_team"]},
         }
 
-    Each outcome's ``decision`` is Jev-shaped JSON::
+    Each outcome's ``decision`` is typed decision JSON::
 
         {"nouls": {name: {"type": "noul", "noul": 0.99}},
          "scores": {name: {"value": 1.8, "confidence": 0.89}},
@@ -383,7 +383,7 @@ def decide(
     if isinstance(questions, str):
         questions = json.loads(questions)
     if isinstance(questions, Mapping) and isinstance(questions.get("questions"), Mapping):
-        questions = questions["questions"]  # accept a full Jev config object
+        questions = questions["questions"]  # accept a full config object with a questions key
     StrotCompiler.validate_questions_config(questions)
 
     records = as_records(data)
