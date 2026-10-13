@@ -712,10 +712,10 @@ class StrotCompiler:
             raise RouterConfigurationError("questions must be a non-empty mapping.")
         for name, spec in questions.items():
             if not isinstance(spec, Mapping) or spec.get("type") not in (
-                "noul", "score", "choice",
+                "boolean", "score", "choice",
             ):
                 raise RouterConfigurationError(
-                    f"question {name!r}: type must be 'noul', 'score', or 'choice'."
+                    f"question {name!r}: type must be 'boolean', 'score', or 'choice'."
                 )
             if spec["type"] == "score":
                 minimum, maximum = spec.get("min"), spec.get("max")
@@ -732,10 +732,10 @@ class StrotCompiler:
                     raise RouterConfigurationError(
                         f"question {name!r}: score requires instructions anchoring the scale."
                     )
-            elif spec["type"] == "noul":
+            elif spec["type"] == "boolean":
                 if not isinstance(spec.get("instructions"), str) or not spec["instructions"].strip():
                     raise RouterConfigurationError(
-                        f"question {name!r}: noul requires instructions."
+                        f"question {name!r}: boolean requires instructions."
                     )
             else:  # choice
                 options = spec.get("options")
@@ -774,7 +774,7 @@ class StrotCompiler:
                 "records. For 'score' add \"min\" (copy the config int) and "
                 "\"rubric\": a list of exactly (max - min + 1) short level "
                 "labels, in order from min to max, grounded in the "
-                "instructions' anchors. For 'noul' add \"criteria\": "
+                "instructions' anchors. For 'boolean' add \"criteria\": "
                 "{\"false\": <short negative-case description>, \"true\": "
                 "<short positive-case description>}.",
                 "- `def route_context(record: dict) -> str:` projecting ONLY "
@@ -836,7 +836,7 @@ class StrotCompiler:
                         f"question {name!r}: rubric must be a list of exactly "
                         f"{expected_len} non-empty level labels"
                     )
-            else:  # noul
+            else:  # boolean
                 criteria = item.get("criteria")
                 if not isinstance(criteria, dict) or set(criteria) != {"false", "true"}:
                     return (
@@ -870,9 +870,9 @@ class StrotCompiler:
                     raise RouterConfigurationError(
                         f"golden[{i}].{qname}: expected must be one of {spec['options']}."
                     )
-                if spec["type"] == "noul" and not isinstance(expected, bool):
+                if spec["type"] == "boolean" and not isinstance(expected, bool):
                     raise RouterConfigurationError(
-                        f"golden[{i}].{qname}: noul expectation must be true/false."
+                        f"golden[{i}].{qname}: boolean expectation must be true/false."
                     )
                 if spec["type"] == "score":
                     is_range = (
@@ -912,11 +912,11 @@ class StrotCompiler:
                         failures.append(
                             f"golden[{i}].{qname}: selected {got!r}, expected {expected!r}"
                         )
-                elif qtype == "noul":
-                    p = decision["nouls"][qname]["noul"]
+                elif qtype == "boolean":
+                    p = decision["booleans"][qname]["probability"]
                     if (p >= 0.5) != expected:
                         failures.append(
-                            f"golden[{i}].{qname}: noul={p:.2f}, expected "
+                            f"golden[{i}].{qname}: probability={p:.2f}, expected "
                             f"{'true' if expected else 'false'}"
                         )
                 else:  # score
@@ -949,7 +949,7 @@ class StrotCompiler:
         """Decide mode: compile a typed-question decision config.
 
         The synthesis agent expands the config (criteria descriptions, score
-        rubrics, noul case descriptions) against the verified schema and
+        rubrics, boolean case descriptions) against the verified schema and
         writes the state projection; the local decision model answers all
         questions per record at runtime in one batched pass. With ``golden``,
         candidates are executed against known-answer records inside the

@@ -384,7 +384,7 @@ def decide(
     object with a top-level ``"questions"`` key is also accepted)::
 
         {
-          "is_bug_report": {"type": "noul", "instructions": "..."},
+          "is_bug_report": {"type": "boolean", "instructions": "..."},
           "customer_sentiment": {"type": "score", "min": 1, "max": 5,
                                   "instructions": "..."},
           "routing_bucket": {"type": "choice",
@@ -393,13 +393,13 @@ def decide(
 
     Each outcome's ``decision`` is typed decision JSON::
 
-        {"nouls": {name: {"type": "noul", "noul": 0.99}},
+        {"booleans": {name: {"type": "boolean", "probability": 0.99}},
          "scores": {name: {"value": 1.8, "confidence": 0.89}},
          "choices": {name: {"selected": ..., "probabilities": {...},
                              "confidence": 0.94}}}
 
     The compile phase (once per config + schema) synthesizes choice criteria,
-    score rubrics, noul case descriptions, and the state projection; at
+    score rubrics, boolean case descriptions, and the state projection; at
     runtime the local ML decision model answers all questions per record in
     one batched pass. Output is bounded, type-safe JSON - nothing generated.
     """

@@ -420,7 +420,7 @@ class TestEpisodeLog:
 
 
 DECIDE_CONFIG = {
-    "is_bug": {"type": "noul", "instructions": "Does this mention crashes or errors?"},
+    "is_bug": {"type": "boolean", "instructions": "Does this mention crashes or errors?"},
     "sentiment": {"type": "score", "min": 1, "max": 3,
                   "instructions": "1 is angry complaint, 3 is happy praise."},
     "team": {"type": "choice", "options": ["billing", "engineering"]},
@@ -428,7 +428,7 @@ DECIDE_CONFIG = {
 
 VALID_DECIDE = '''```python
 QUESTIONS = {
-    "is_bug": {"type": "noul", "instructions": "Does this mention crashes or errors?",
+    "is_bug": {"type": "boolean", "instructions": "Does this mention crashes or errors?",
                "criteria": {"false": "normal request no malfunction",
                             "true": "crash defect error malfunction"}},
     "sentiment": {"type": "score", "min": 1,
@@ -453,9 +453,9 @@ class TestDecide:
         assert result.mode == "decide"
         assert len(result.outcomes) == 2
         crash = result.outcomes[1]["decision"]  # body: "app crash defect"
-        assert set(crash) == {"nouls", "scores", "choices"}
-        assert crash["nouls"]["is_bug"]["type"] == "noul"
-        assert crash["nouls"]["is_bug"]["noul"] > 0.9
+        assert set(crash) == {"booleans", "scores", "choices"}
+        assert crash["booleans"]["is_bug"]["type"] == "boolean"
+        assert crash["booleans"]["is_bug"]["probability"] > 0.9
         assert crash["choices"]["team"]["selected"] == "engineering"
         assert set(crash["choices"]["team"]["probabilities"]) == {"billing", "engineering"}
         assert 0.0 <= crash["choices"]["team"]["confidence"] <= 1.0

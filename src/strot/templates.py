@@ -223,7 +223,7 @@ Synthesized by strot-ai (STROT: Structured Task Reasoning and
 Output Transformation, arXiv:2505.01636) in decide mode: a
 typed-question config compiled against the verified schema. Per record, the
 local decision model answers every question in one batched pass and the
-output is exclusively type-safe JSON (nouls / scores / choices with
+output is exclusively type-safe JSON (booleans / scores / choices with
 probabilities and confidences) - nothing is generated, only selected,
 scored, and computed.
 
@@ -262,11 +262,15 @@ DECIDE_FOOTER_TEMPLATE = '''\
 
 
 def _julia_questions() -> Dict[str, Any]:
-    """Expand QUESTIONS into the decision model's native typed format."""
+    """Expand QUESTIONS into the decision model's native typed format.
+
+    STROT's public type "boolean" maps to the model package's internal
+    wire type at this boundary only; it never appears in STROT's API.
+    """
     prepared: Dict[str, Any] = {{}}
     for name, spec in QUESTIONS.items():
         question: Dict[str, Any] = {{
-            "type": spec["type"],
+            "type": "noul" if spec["type"] == "boolean" else spec["type"],
             "instructions": spec["instructions"],
         }}
         if spec["type"] == "score":
@@ -297,12 +301,12 @@ class CompiledDecider:
     def process(self, record: Mapping[str, Any]) -> Dict[str, Any]:
         state = route_context(dict(record))  # compile-time-synthesized projection
         answers = self._engine.predict(state=state, questions=self._questions)["answers"]
-        output: Dict[str, Dict[str, Any]] = {{"nouls": {{}}, "scores": {{}}, "choices": {{}}}}
+        output: Dict[str, Dict[str, Any]] = {{"booleans": {{}}, "scores": {{}}, "choices": {{}}}}
         for name, answer in answers.items():
-            if answer["type"] == "noul":
-                output["nouls"][name] = {{
-                    "type": "noul",
-                    "noul": round(float(answer["noul"]), 4),
+            if answer["type"] == "noul":  # model package's wire name for boolean
+                output["booleans"][name] = {{
+                    "type": "boolean",
+                    "probability": round(float(answer["noul"]), 4),
                 }}
             elif answer["type"] == "score":
                 value = QUESTIONS[name]["min"] + float(answer["score"])
