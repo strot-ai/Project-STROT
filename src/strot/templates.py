@@ -301,6 +301,122 @@ if __name__ == "__main__":
     print(json.dumps(CompiledAnalysis().process(json.load(sys.stdin)), default=str))
 '''
 
+DECIDE_HEADER_TEMPLATE = '''\
+"""Compiled STROT decision asset. DO NOT EDIT BY HAND.
+
+Synthesized by strot-ai (STROT: Structured Task Reasoning and
+Output Transformation, arXiv:2505.01636) in decide mode: a Jev-compatible
+typed-question config compiled against the verified schema. Per record, the
+local decision model answers every question in one batched pass and the
+output is exclusively type-safe JSON (nouls / scores / choices with
+probabilities and confidences) - nothing is generated, only selected,
+scored, and computed.
+
+    nlu_model : {nlu_model}
+
+Runtime dependency: the supersonic-julia package + checkpoint
+(see strot.prefetch_nlu; never `pip install julia`).
+"""
+
+import json
+import os
+from typing import Any, Dict, List, Mapping, Sequence
+
+try:
+    from julia import load_model
+except ImportError as _exc:  # pragma: no cover - environment guard
+    raise RuntimeError(
+        "This compiled decision asset needs the 'supersonic-julia' package "
+        "(do NOT `pip install julia`). Install:\\n"
+        "  python -c \\"from huggingface_hub import snapshot_download; "
+        "snapshot_download('{nlu_model}', local_dir='Julia-1')\\"\\n"
+        "  pip install ./Julia-1"
+    ) from _exc
+
+NLU_MODEL = {nlu_model!r}
+
+DATASET_SCHEMA: Dict[str, Any] = {schema_literal}
+
+#: The original Jev-compatible question config this asset was compiled from.
+QUESTIONS_CONFIG: Dict[str, Any] = {config_literal}
+'''
+
+DECIDE_FOOTER_TEMPLATE = '''\
+# --- Statically synthesized question expansion (STROT synthesizer output) ---
+{generated_paths}
+
+
+def _julia_questions() -> Dict[str, Any]:
+    """Expand QUESTIONS into the decision model's native typed format."""
+    prepared: Dict[str, Any] = {{}}
+    for name, spec in QUESTIONS.items():
+        question: Dict[str, Any] = {{
+            "type": spec["type"],
+            "instructions": spec["instructions"],
+        }}
+        if spec["type"] == "score":
+            question["criteria"] = list(spec["rubric"])
+        else:
+            question["criteria"] = spec["criteria"]
+        prepared[name] = question
+    return prepared
+
+
+class CompiledDecider:
+    """Self-decision asset: one batched typed-decision pass per record."""
+
+    def __init__(self) -> None:
+        checkpoint = os.environ.get("STROT_NLU_CHECKPOINT")
+        if checkpoint is None:
+            from pathlib import Path
+
+            if Path(NLU_MODEL).is_dir():
+                checkpoint = NLU_MODEL
+            else:
+                from huggingface_hub import snapshot_download
+
+                checkpoint = snapshot_download(NLU_MODEL)
+        self._engine = load_model(checkpoint, device="cpu")
+        self._questions = _julia_questions()
+
+    def process(self, record: Mapping[str, Any]) -> Dict[str, Any]:
+        state = route_context(dict(record))  # compile-time-synthesized projection
+        answers = self._engine.predict(state=state, questions=self._questions)["answers"]
+        output: Dict[str, Dict[str, Any]] = {{"nouls": {{}}, "scores": {{}}, "choices": {{}}}}
+        for name, answer in answers.items():
+            if answer["type"] == "noul":
+                output["nouls"][name] = {{
+                    "type": "noul",
+                    "noul": round(float(answer["noul"]), 4),
+                }}
+            elif answer["type"] == "score":
+                value = QUESTIONS[name]["min"] + float(answer["score"])
+                output["scores"][name] = {{
+                    "value": round(value, 2),
+                    "confidence": round(float(answer["max_probability"]), 4),
+                }}
+            else:
+                output["choices"][name] = {{
+                    "selected": answer["choice"],
+                    "probabilities": {{
+                        key: round(float(p), 4)
+                        for key, p in answer["probabilities"].items()
+                    }},
+                    "confidence": round(float(answer["max_probability"]), 4),
+                }}
+        return output
+
+
+if __name__ == "__main__":
+    import sys
+
+    decider = CompiledDecider()
+    for line in sys.stdin:
+        line = line.strip()
+        if line:
+            print(json.dumps(decider.process(json.loads(line)), default=str))
+'''
+
 ASSET_FOOTER_TEMPLATE = '''\
 # --- Statically generated execution paths (STROT synthesizer output) ---
 {generated_paths}

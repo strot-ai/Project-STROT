@@ -99,16 +99,42 @@ def _build_fake_julia():
     (rows of {state, question, options} -> [{index, probabilities}])."""
     julia_mod = types.ModuleType("julia")
 
+    def _softmax_overlap(state, labels):
+        exps = [math.exp(s * 4.0) for s in _keyword_scores(state, labels)]
+        total = sum(exps)
+        return [e / total for e in exps]
+
     class _FakeEngine:
         def predict(self, rows=None, questions=None, state=None):
+            if questions is not None:  # typed path, mirrors julia/typed.py output
+                answers = {}
+                for qid, q in questions.items():
+                    kind = q["type"]
+                    if kind == "choice":
+                        keys = list(q["criteria"])
+                        labels = list(q["criteria"].values())
+                    elif kind == "score":
+                        labels = list(q["criteria"])
+                        keys = [str(i) for i in range(len(labels))]
+                    else:  # noul
+                        keys = ["false", "true"]
+                        criteria = q.get("criteria")
+                        labels = [criteria["false"], criteria["true"]] if criteria else keys
+                    probs = _softmax_overlap(state, labels)
+                    answer = {"type": kind, "probabilities": dict(zip(keys, probs))}
+                    if kind == "choice":
+                        answer["choice"] = keys[max(range(len(probs)), key=probs.__getitem__)]
+                    elif kind == "score":
+                        answer["score"] = sum(i * p for i, p in enumerate(probs))
+                    else:
+                        answer["noul"] = probs[1]
+                    if kind != "noul":
+                        answer["max_probability"] = max(probs)
+                    answers[qid] = answer
+                return {"answers": answers}
             results = []
             for row in rows:
-                exps = [
-                    math.exp(s * 4.0)
-                    for s in _keyword_scores(row["state"], row["options"])
-                ]
-                total = sum(exps)
-                probs = [e / total for e in exps]
+                probs = _softmax_overlap(row["state"], row["options"])
                 results.append(
                     {
                         "index": max(range(len(probs)), key=probs.__getitem__),
@@ -353,3 +379,73 @@ PLAN = [
             pytest.skip("anthropic installed; factory would construct a real client")
         with pytest.raises(RouterConfigurationError, match="anthropic"):
             strot.run(SAMPLE, QUERY, REGISTRY, llm="anthropic/claude-opus-4-8", state=tmp_path)
+
+
+DECIDE_CONFIG = {
+    "is_bug": {"type": "noul", "instructions": "Does this mention crashes or errors?"},
+    "sentiment": {"type": "score", "min": 1, "max": 3,
+                  "instructions": "1 is angry complaint, 3 is happy praise."},
+    "team": {"type": "choice", "options": ["billing", "engineering"]},
+}
+
+VALID_DECIDE = '''```python
+QUESTIONS = {
+    "is_bug": {"type": "noul", "instructions": "Does this mention crashes or errors?",
+               "criteria": {"false": "normal request no malfunction",
+                            "true": "crash defect error malfunction"}},
+    "sentiment": {"type": "score", "min": 1,
+                  "instructions": "1 is angry complaint, 3 is happy praise.",
+                  "rubric": ["angry complaint charge dispute", "neutral request", "happy praise"]},
+    "team": {"type": "choice", "instructions": "Which team should handle this?",
+             "criteria": {"billing": "billing charge payment",
+                          "engineering": "crash defect bug"}},
+}
+
+
+def route_context(record: dict) -> str:
+    return str(record.get("body", ""))
+```'''
+
+
+class TestDecide:
+    def test_decide_outputs_jev_shaped_json(self, tmp_path, fake_runtime):
+        llm = ScriptedLLM([VALID_DECIDE])
+        result = strot.decide(SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path)
+        assert llm.calls == 1
+        assert result.mode == "decide"
+        assert len(result.outcomes) == 2
+        crash = result.outcomes[1]["decision"]  # body: "app crash defect"
+        assert set(crash) == {"nouls", "scores", "choices"}
+        assert crash["nouls"]["is_bug"]["type"] == "noul"
+        assert crash["nouls"]["is_bug"]["noul"] > 0.9
+        assert crash["choices"]["team"]["selected"] == "engineering"
+        assert set(crash["choices"]["team"]["probabilities"]) == {"billing", "engineering"}
+        assert 0.0 <= crash["choices"]["team"]["confidence"] <= 1.0
+        billing = result.outcomes[0]["decision"]  # body: "double billing charge"
+        assert billing["choices"]["team"]["selected"] == "billing"
+        assert 1.0 <= billing["scores"]["sentiment"]["value"] <= 3.0
+        assert billing["scores"]["sentiment"]["value"] < 1.5  # angry complaint
+        # Warm call: no LLM.
+        warm = strot.decide(SAMPLE, DECIDE_CONFIG, llm=ExplodingLLM(), state=tmp_path)
+        assert warm.cache_hit is True
+
+    def test_decide_accepts_full_jev_config_json_string(self, tmp_path, fake_runtime):
+        config = json.dumps({"model": "jev-latest", "state": "ignored",
+                             "questions": DECIDE_CONFIG})
+        result = strot.decide(SAMPLE, config, llm=ScriptedLLM([VALID_DECIDE]), state=tmp_path)
+        assert len(result.outcomes) == 2
+
+    def test_decide_validates_config_before_any_llm_call(self, tmp_path):
+        bad = {"q": {"type": "score", "min": 1, "max": 99, "instructions": "x"}}
+        with pytest.raises(RouterConfigurationError, match="2-20"):
+            strot.decide(SAMPLE, bad, llm=ExplodingLLM(), state=tmp_path)
+
+    def test_decide_expansion_errors_feed_repair_loop(self, tmp_path, fake_runtime):
+        missing_rubric = VALID_DECIDE.replace(
+            '"rubric": ["angry complaint charge dispute", "neutral request", "happy praise"]',
+            '"rubric": ["angry", "happy"]',
+        )
+        llm = ScriptedLLM([missing_rubric, VALID_DECIDE])
+        result = strot.decide(SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path)
+        assert result.attempts == 2
+

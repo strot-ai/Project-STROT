@@ -19,6 +19,7 @@ producing a completely standalone production asset.
 from __future__ import annotations
 
 import ast
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -501,6 +502,195 @@ class StrotCompiler:
             return ast.literal_eval(plan_node), None
         except (ValueError, SyntaxError):
             return None, "PLAN must be a literal list of tool-call objects."
+
+    @staticmethod
+    def validate_questions_config(questions: Mapping[str, Any]) -> None:
+        """Validate a Jev-compatible question config before any synthesis."""
+        if not isinstance(questions, Mapping) or not questions:
+            raise RouterConfigurationError("questions must be a non-empty mapping.")
+        for name, spec in questions.items():
+            if not isinstance(spec, Mapping) or spec.get("type") not in (
+                "noul", "score", "choice",
+            ):
+                raise RouterConfigurationError(
+                    f"question {name!r}: type must be 'noul', 'score', or 'choice'."
+                )
+            if spec["type"] == "score":
+                minimum, maximum = spec.get("min"), spec.get("max")
+                if (
+                    type(minimum) is not int
+                    or type(maximum) is not int
+                    or not 2 <= (maximum - minimum + 1) <= 20
+                ):
+                    raise RouterConfigurationError(
+                        f"question {name!r}: score needs int min < max spanning "
+                        "2-20 levels (the decision model's option range)."
+                    )
+                if not isinstance(spec.get("instructions"), str) or not spec["instructions"].strip():
+                    raise RouterConfigurationError(
+                        f"question {name!r}: score requires instructions anchoring the scale."
+                    )
+            elif spec["type"] == "noul":
+                if not isinstance(spec.get("instructions"), str) or not spec["instructions"].strip():
+                    raise RouterConfigurationError(
+                        f"question {name!r}: noul requires instructions."
+                    )
+            else:  # choice
+                options = spec.get("options")
+                if (
+                    not isinstance(options, list)
+                    or not 2 <= len(options) <= 20
+                    or len(set(options)) != len(options)
+                    or not all(isinstance(o, str) and o for o in options)
+                ):
+                    raise RouterConfigurationError(
+                        f"question {name!r}: choice needs 2-20 unique non-empty options."
+                    )
+
+    def build_decide_prompt(self, schema: DatasetSchema, questions: Mapping[str, Any]) -> str:
+        """Construct the decide-mode prompt: expand a Jev config for the model."""
+        return "\n".join(
+            [
+                "You are the STROT synthesizer. Expand a typed-question config "
+                "for a small local decision model - you configure, you do not "
+                "write programs.",
+                "",
+                "## VERIFIED DATASET SCHEMA",
+                schema.to_json(),
+                "",
+                "## DECISION CONFIG (Jev-compatible)",
+                json.dumps(questions, indent=2),
+                "",
+                "## OUTPUT CONTRACT",
+                "Emit exactly one ```python code block containing EXACTLY two "
+                "top-level definitions and nothing else:",
+                "- `QUESTIONS: Dict[str, Any]` literal with the SAME question "
+                "names. Per question: keep \"type\" and \"instructions\" (write "
+                "crisp instructions if the config omits them). For 'choice' add "
+                "\"criteria\": a dict mapping EVERY option (exact strings) to a "
+                "short discriminative description using vocabulary from the "
+                "records. For 'score' add \"min\" (copy the config int) and "
+                "\"rubric\": a list of exactly (max - min + 1) short level "
+                "labels, in order from min to max, grounded in the "
+                "instructions' anchors. For 'noul' add \"criteria\": "
+                "{\"false\": <short negative-case description>, \"true\": "
+                "<short positive-case description>}.",
+                "- `def route_context(record: dict) -> str:` projecting ONLY "
+                "the fields relevant to answering the questions into a compact "
+                "string.",
+                "",
+                "Rules: short, mutually distinct labels dramatically outperform "
+                "long ones; no imports, no other statements.",
+            ]
+        )
+
+    def _validate_decide_candidate(
+        self, code: str, questions: Mapping[str, Any]
+    ) -> Optional[str]:
+        error = self._validate_candidate(code, ["route_context"])
+        if error:
+            return error
+        tree = ast.parse(code)
+        value_node = None
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(isinstance(t, ast.Name) and t.id == "QUESTIONS" for t in targets):
+                    value_node = node.value
+        if value_node is None:
+            return "Missing required module-level literal QUESTIONS."
+        try:
+            expanded = ast.literal_eval(value_node)
+        except (ValueError, SyntaxError):
+            return "QUESTIONS must be a literal dict."
+        if set(expanded) != set(questions):
+            return f"QUESTIONS keys must exactly match the config: {sorted(questions)}"
+        for name, spec in questions.items():
+            item = expanded[name]
+            if not isinstance(item, dict) or item.get("type") != spec["type"]:
+                return f"question {name!r}: type must stay {spec['type']!r}"
+            if not isinstance(item.get("instructions"), str) or not item["instructions"].strip():
+                return f"question {name!r}: instructions must be a non-empty string"
+            if spec["type"] == "choice":
+                criteria = item.get("criteria")
+                if not isinstance(criteria, dict) or set(criteria) != set(spec["options"]):
+                    return (
+                        f"question {name!r}: criteria keys must exactly match "
+                        f"the options {spec['options']}"
+                    )
+                if not all(isinstance(v, str) and v.strip() for v in criteria.values()):
+                    return f"question {name!r}: criteria descriptions must be non-empty strings"
+            elif spec["type"] == "score":
+                expected_len = spec["max"] - spec["min"] + 1
+                rubric = item.get("rubric")
+                if item.get("min") != spec["min"]:
+                    return f"question {name!r}: min must equal {spec['min']}"
+                if (
+                    not isinstance(rubric, list)
+                    or len(rubric) != expected_len
+                    or not all(isinstance(v, str) and v.strip() for v in rubric)
+                ):
+                    return (
+                        f"question {name!r}: rubric must be a list of exactly "
+                        f"{expected_len} non-empty level labels"
+                    )
+            else:  # noul
+                criteria = item.get("criteria")
+                if not isinstance(criteria, dict) or set(criteria) != {"false", "true"}:
+                    return (
+                        f"question {name!r}: criteria must map exactly "
+                        "'false' and 'true' to descriptions"
+                    )
+        return None
+
+    def compile_decide(self, sample: Any, questions: Mapping[str, Any]) -> CompiledAsset:
+        """Decide mode: compile a Jev-compatible typed-question config.
+
+        The synthesis agent expands the config (criteria descriptions, score
+        rubrics, noul case descriptions) against the verified schema and
+        writes the state projection; the local decision model answers all
+        questions per record at runtime in one batched pass.
+        """
+        if self.runtime_kind != "local":
+            raise RouterConfigurationError(
+                "decide mode currently requires a local decision model "
+                f"(got {self.nlu_model!r})."
+            )
+        self.validate_questions_config(questions)
+        schema = introspect_schema(sample)
+        prompt = self.build_decide_prompt(schema, questions)
+        generated, attempts = self._synthesize_with(
+            prompt, lambda code: self._validate_decide_candidate(code, questions)
+        )
+        source = (
+            "\n\n".join(
+                [
+                    templates.DECIDE_HEADER_TEMPLATE.format(
+                        nlu_model=self.nlu_model,
+                        schema_literal=repr(schema.to_dict()),
+                        config_literal=repr(dict(questions)),
+                    ),
+                    templates.DECIDE_FOOTER_TEMPLATE.format(generated_paths=generated),
+                ]
+            )
+            + "\n"
+        )
+        try:
+            ast.parse(source)
+        except SyntaxError as exc:  # template regression guard
+            raise CompilationError(
+                f"Assembled decision asset failed final syntax validation: {exc}",
+                attempts=attempts,
+                last_error=str(exc),
+            ) from exc
+        return CompiledAsset(
+            source=source,
+            nlu_model=self.nlu_model,
+            runtime_kind="decide",
+            goal=json.dumps(questions, sort_keys=True),
+            schema=schema,
+            attempts=attempts,
+        )
 
     def compile_research(self, sample: Any, goal: str) -> CompiledAsset:
         """Research mode: the agent calls SQL template tools; DuckDB executes.

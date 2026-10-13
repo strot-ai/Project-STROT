@@ -60,6 +60,13 @@ class RunResult:
     analysis: Optional[Dict[str, Any]] = None  #: research-mode computed insights
 
     def summary(self) -> Dict[str, Any]:
+        if self.mode == "decide":
+            return {
+                "mode": "decide",
+                "processed": len(self.outcomes),
+                "cache_hit": self.cache_hit,
+                "artifact": str(self.artifact_path),
+            }
         if self.mode == "research":
             return {
                 "mode": "research",
@@ -335,4 +342,102 @@ def run(
                     "reason": str(exc),
                 }
             )
+    return result
+
+
+def decide(
+    data: Any,
+    questions: Union[str, Mapping[str, Any]],
+    llm: LLMSpec = "openai/gpt-4o",
+    nlu: str = DEFAULT_NLU_MODEL,
+    state: Union[str, Path] = ".strot",
+    sample_size: int = 25,
+    max_retries: int = 3,
+    execute: bool = True,
+) -> RunResult:
+    """Answer a Jev-compatible typed-question config over every record.
+
+    ``questions`` uses Jev's structure (a dict or JSON string; a full config
+    object with a top-level ``"questions"`` key is also accepted)::
+
+        {
+          "is_bug_report": {"type": "noul", "instructions": "..."},
+          "customer_sentiment": {"type": "score", "min": 1, "max": 5,
+                                  "instructions": "..."},
+          "routing_bucket": {"type": "choice",
+                              "options": ["billing_team", "engineering_team"]},
+        }
+
+    Each outcome's ``decision`` is Jev-shaped JSON::
+
+        {"nouls": {name: {"type": "noul", "noul": 0.99}},
+         "scores": {name: {"value": 1.8, "confidence": 0.89}},
+         "choices": {name: {"selected": ..., "probabilities": {...},
+                             "confidence": 0.94}}}
+
+    The compile phase (once per config + schema) synthesizes choice criteria,
+    score rubrics, noul case descriptions, and the state projection; at
+    runtime the local ML decision model answers all questions per record in
+    one batched pass. Output is bounded, type-safe JSON - nothing generated.
+    """
+    if isinstance(questions, str):
+        questions = json.loads(questions)
+    if isinstance(questions, Mapping) and isinstance(questions.get("questions"), Mapping):
+        questions = questions["questions"]  # accept a full Jev config object
+    StrotCompiler.validate_questions_config(questions)
+
+    records = as_records(data)
+    sample = records[:sample_size]
+    schema = introspect_schema(sample)
+    canonical_config = json.dumps(questions, sort_keys=True)
+    key = cache_key(
+        canonical_config, None, nlu, schema, None, 0.0, mode="decide"
+    )
+    artifact_path, meta_path = _artifact_paths(state, key)
+
+    cache_hit = artifact_path.exists()
+    attempts = 0
+    if not cache_hit:
+        compiler = StrotCompiler(
+            nlu_model=nlu,
+            llm_client=_resolve_llm(llm),
+            max_retries=max_retries,
+        )
+        asset = compiler.compile_decide(sample=sample, questions=questions)
+        attempts = asset.attempts
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        asset.save(artifact_path)
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "cache_key": key,
+                    "mode": "decide",
+                    "questions": dict(questions),
+                    "nlu": nlu,
+                    "attempts": asset.attempts,
+                    "schema": schema_fingerprint(schema),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    result = RunResult(
+        outcomes=[],
+        fallbacks=[],
+        artifact_path=artifact_path,
+        cache_hit=cache_hit,
+        cache_key=key,
+        attempts=attempts,
+        mode="decide",
+    )
+    if not execute:
+        return result
+
+    module = _load_artifact(artifact_path, key)
+    result.pipeline = module.CompiledDecider()
+    for index, record in enumerate(records):
+        result.outcomes.append(
+            {"index": index, "record": record, "decision": result.pipeline.process(record)}
+        )
     return result
