@@ -119,6 +119,7 @@ After that, production runs fully offline. (Never `pip install julia` — that's
 
 - **Compile once, decide forever** — content-addressed artifact cache; schema drift automatically triggers exactly one recompile
 - **Golden-record promotion** — a candidate artifact is executed against your known answers inside the compile loop; only passing artifacts are ever served
+- **Measured label search** — the compiler scores its synthesized routing labels against the bare registry keys on a teacher-labeled sample and bakes the winner: measurement instead of guessing (on by default with `target_risk`, or via `measure_labels=True`)
 - **Fitted guarantees** — temperature scaling + split conformal prediction (fitted on disjoint folds to preserve validity), baked into the artifact. The guarantee is marginal: under exchangeability, wrong dispatches are ≤ α of all records; non-singleton prediction sets abstain. The conditional-on-dispatch bound (α / dispatch rate) is reported in the artifact's calibration metadata
 - **0% structural hallucination** — output is selection + computation over your registry; nothing is generated at runtime
 - **Model-independent** — the decision model is a slot (`nlu=`): local Julia-1 by default, hosted APIs, or any drop-in selector; the compiler, gates, and calibration keep their value across all of them

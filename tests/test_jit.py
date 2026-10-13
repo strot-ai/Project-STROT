@@ -396,6 +396,57 @@ class TestCalibration:
             strot.run(SAMPLE, QUERY, REGISTRY, llm=ExplodingLLM(), state=tmp_path, target_risk=1.5)
 
 
+class TestMeasuredLabels:
+    TEACHER = '```python\nLABELS = ["billing", "defect"]\n```'
+
+    def test_bad_synthesized_labels_lose_to_registry_keys(self, tmp_path, fake_runtime):
+        # Synthesized labels match nothing in the records; bare keys match.
+        bad_labels = VALID_PATHS.replace(
+            'ROUTING_LABELS = {"billing": "billing", "defect": "defect"}',
+            'ROUTING_LABELS = {"billing": "zzz", "defect": "qqq"}',
+        )
+        llm = ScriptedLLM([bad_labels, self.TEACHER])
+        result = strot.run(
+            SAMPLE, QUERY, REGISTRY, llm=llm, state=tmp_path, measure_labels=True
+        )
+        assert llm.calls == 2  # synthesis + one teacher call
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        assert meta["label_search"]["winner"] == "registry_keys"
+        assert meta["label_search"]["scores"]["registry_keys"] > meta["label_search"]["scores"]["synthesized"]
+        # The measured winner actually routes correctly at runtime.
+        routed = {o["record"]["ticket_id"]: o["action"] for o in result.outcomes}
+        assert routed == {1: "billing", 2: "defect"}
+        assert "Measured label search winner" in result.artifact_path.read_text()
+
+    def test_good_synthesized_labels_are_kept(self, tmp_path, fake_runtime):
+        # Identical candidates (keys == synthesized): measurement short-circuits.
+        llm = ScriptedLLM([VALID_PATHS, self.TEACHER])
+        result = strot.run(
+            SAMPLE, QUERY, REGISTRY, llm=llm, state=tmp_path, measure_labels=True
+        )
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        assert meta["label_search"]["winner"] == "synthesized"
+        assert "Measured label search winner" not in result.artifact_path.read_text()
+
+    def test_measurement_defaults_on_with_target_risk(self, tmp_path, fake_runtime):
+        llm = ScriptedLLM([VALID_PATHS, self.TEACHER])
+        result = strot.run(
+            SAMPLE, QUERY, REGISTRY, llm=llm, state=tmp_path, target_risk=0.5
+        )
+        assert llm.calls == 2  # measurement shares the single teacher call
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        assert meta["label_search"] is not None
+        assert meta["calibration"] is not None
+
+    def test_measure_flag_is_part_of_cache_key(self, tmp_path, fake_runtime):
+        plain = strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path)
+        measured = strot.run(
+            SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS, self.TEACHER]),
+            state=tmp_path, measure_labels=True,
+        )
+        assert plain.cache_key != measured.cache_key
+
+
 class TestEpisodeLog:
     def test_promoted_compile_logged_once(self, tmp_path, fake_runtime):
         strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path)

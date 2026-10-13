@@ -171,6 +171,7 @@ class CompiledAsset:
     schema: DatasetSchema
     attempts: int
     calibration: Optional[Dict[str, Any]] = None  #: fitted stats (None = uncalibrated)
+    label_search: Optional[Dict[str, Any]] = None  #: measured-labeling scores (None = not measured)
 
     def save(self, path: Union[str, Path] = "compiled_pipeline.py") -> Path:
         """Persist the asset as an independent Python file."""
@@ -601,6 +602,55 @@ class StrotCompiler:
             distributions, true_indices, alpha=target_risk
         )
 
+    def _measure_labelings(
+        self,
+        source: str,
+        records: List[Dict[str, Any]],
+        true_indices: List[int],
+        action_registry: Mapping[str, str],
+        question: Optional[str],
+        goal: str,
+    ) -> "tuple[str, Dict[str, str], Dict[str, float]]":
+        """Score candidate labelings on the teacher-labeled sample; keep the best.
+
+        Candidates: the synthesized ROUTING_LABELS and the bare registry keys.
+        Measurement replaces guessing - benchmarks showed synthesis wins when
+        integration is the bottleneck and loses when the keys are already
+        optimal; scoring both captures both cases. Ties keep the synthesized
+        labeling (listed first).
+        """
+        import sys
+
+        module = self._load_candidate_module(source)
+        try:
+            router = module._RuntimeRouter()
+            routing_question = question or (
+                f"Which execution path best achieves the goal: {goal}?"
+            )
+            candidates: Dict[str, Dict[str, str]] = {
+                "synthesized": {k: module.ROUTING_LABELS[k] for k in action_registry},
+                "registry_keys": {
+                    k: k.replace("_", " ").strip() for k in action_registry
+                },
+            }
+            if candidates["registry_keys"] == candidates["synthesized"]:
+                return "synthesized", candidates["synthesized"], {"synthesized": -1.0}
+            scores: Dict[str, float] = {}
+            for name, labels in candidates.items():
+                options = [labels[key] for key in action_registry]
+                correct = 0
+                for record, true_index in zip(records, true_indices):
+                    decision = router.select(
+                        module.route_context(dict(record)), routing_question, options
+                    )
+                    if decision.index == true_index:
+                        correct += 1
+                scores[name] = round(correct / len(records), 4)
+        finally:
+            sys.modules.pop("strot_golden_gate", None)
+        winner = max(scores, key=lambda k: (scores[k], k == "synthesized"))
+        return winner, candidates[winner], scores
+
     def compile(
         self,
         sample: Any,
@@ -609,6 +659,7 @@ class StrotCompiler:
         question: Optional[str] = None,
         golden: Optional[List[Mapping[str, Any]]] = None,
         target_risk: Optional[float] = None,
+        measure_labels: bool = False,
     ) -> CompiledAsset:
         """Run the full compile-time pipeline and return the production asset.
 
@@ -635,6 +686,11 @@ class StrotCompiler:
                 on dispatching is bounded by alpha / dispatch_rate, reported
                 in the calibration metadata). Requires the decision runtime
                 on the compile box.
+            measure_labels: Score candidate labelings (the synthesized labels
+                vs the bare registry keys) on the teacher-labeled sample and
+                bake the winner - measurement instead of guessing. Needs the
+                teacher labels, so it shares the one teacher call with
+                target_risk (free when calibrating; otherwise triggers it).
         """
         if target_risk is not None and not 0 < target_risk < 1:
             raise RouterConfigurationError("target_risk must be in (0, 1).")
@@ -671,9 +727,11 @@ class StrotCompiler:
 
         _, attempts = self._synthesize_with(prompt, validate)
         source = promoted["source"]
+        final_code = promoted["code"]
 
         calibration: Optional[Dict[str, Any]] = None
-        if target_risk is not None:
+        label_search: Optional[Dict[str, Any]] = None
+        if target_risk is not None or measure_labels:
             records = _sample_records(sample)
             teacher_prompt = self.build_teacher_prompt(goal, action_registry, records)
             labels_code, _ = self._synthesize_with(
@@ -689,30 +747,63 @@ class StrotCompiler:
                     if isinstance(node, (ast.Assign, ast.AnnAssign))
                 )
             )
-            calibration = self._fit_calibration(
-                source, records, labels, action_registry, question, goal, target_risk
-            )
-            source = self._assemble(
-                schema,
-                goal,
-                dict(action_registry),
-                promoted["code"],
-                question,
-                temperature=float(calibration["temperature"]),
-                conformal_q=float(calibration["conformal_quantile"]),
-                calibration=calibration,
-            )
-            if golden:
-                error = self._test_golden_pipeline(source, golden)
-                if error:
-                    raise CompilationError(
-                        "Calibrated artifact no longer satisfies the golden "
-                        f"records at target_risk={target_risk} (the conformal "
-                        "gate abstains on them). Relax target_risk or revisit "
-                        f"the goldens:\n{error}",
-                        attempts=attempts,
-                        last_error=error,
+            action_keys = list(action_registry)
+            true_indices = [action_keys.index(label) for label in labels]
+
+            if measure_labels:
+                winner, winner_labels, scores = self._measure_labelings(
+                    source, records, true_indices, action_registry, question, goal
+                )
+                label_search = {"scores": scores, "winner": winner}
+                if winner != "synthesized":
+                    override = (
+                        "\n\n# Measured label search winner "
+                        "(overrides synthesized labels)\n"
+                        f"ROUTING_LABELS = {winner_labels!r}"
                     )
+                    candidate_code = final_code + override
+                    candidate_source = self._assemble(
+                        schema, goal, dict(action_registry), candidate_code, question
+                    )
+                    golden_error = (
+                        self._test_golden_pipeline(candidate_source, golden)
+                        if golden
+                        else None
+                    )
+                    if golden_error:
+                        # Goldens are a regression gate: a measured winner that
+                        # breaks them is rejected, keeping the synthesized labels.
+                        label_search["winner_rejected_by_golden"] = True
+                        label_search["winner"] = "synthesized"
+                    else:
+                        final_code = candidate_code
+                        source = candidate_source
+
+            if target_risk is not None:
+                calibration = self._fit_calibration(
+                    source, records, labels, action_registry, question, goal, target_risk
+                )
+                source = self._assemble(
+                    schema,
+                    goal,
+                    dict(action_registry),
+                    final_code,
+                    question,
+                    temperature=float(calibration["temperature"]),
+                    conformal_q=float(calibration["conformal_quantile"]),
+                    calibration=calibration,
+                )
+                if golden:
+                    error = self._test_golden_pipeline(source, golden)
+                    if error:
+                        raise CompilationError(
+                            "Calibrated artifact no longer satisfies the golden "
+                            f"records at target_risk={target_risk} (the conformal "
+                            "gate abstains on them). Relax target_risk or revisit "
+                            f"the goldens:\n{error}",
+                            attempts=attempts,
+                            last_error=error,
+                        )
 
         return CompiledAsset(
             source=source,
@@ -722,6 +813,7 @@ class StrotCompiler:
             schema=schema,
             attempts=attempts,
             calibration=calibration,
+            label_search=label_search,
         )
 
     @staticmethod

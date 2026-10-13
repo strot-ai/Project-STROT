@@ -40,10 +40,10 @@ train example per class as goldens.
 
 Measured 2026-10-13 (same environment as above):
 
-| Dataset | Naive | STROT-compiled | + train-goldens |
-|---|---|---|---|
-| AG News | 72.7% | **86.7%** (+14.0) | 80.3% |
-| Emotion | **93.3%** | 85.0% (−8.3) | 70.0% |
+| Dataset | Naive | STROT-compiled | + train-goldens | + measured labels (v0.9.0) |
+|---|---|---|---|---|
+| AG News | 72.7% | **86.7%** (+14.0) | 80.3% | 76.7% (winner: synthesized) |
+| Emotion | **93.3%** | 85.0% (−8.3) | 70.0% | **93.3%** (winner: registry keys) |
 
 **Honest findings, including where STROT loses:**
 
@@ -52,9 +52,16 @@ Measured 2026-10-13 (same environment as above):
    points on text the model must genuinely read).
 2. Compilation can *hurt* when the naive interface is already optimal
    (Emotion tweets literally contain the class words, so bare class names are
-   near-perfect labels and synthesized wording diluted them). The compiler
-   does not yet *measure* candidate labelings against the sample — a known
-   roadmap item these numbers motivate directly.
+   near-perfect labels and synthesized wording diluted them). **Fixed in
+   v0.9.0 by measured label search** (`measure_labels=True`): the compiler
+   scores synthesized labels vs bare registry keys on the teacher-labeled
+   sample and bakes the winner — Emotion fully recovered to 93.3%. Honest
+   limits: measurement selects among available candidates, so it bounds the
+   downside (floor near max of the candidates) but does not eliminate
+   synthesis variance (the AG News measured run drew weaker synthesized
+   labels than the earlier compile: 76.7% vs 86.7%), and a 25-point sample
+   is a noisy judge. Multiple synthesis candidates and larger measurement
+   samples are the known next steps.
 3. Using goldens as an accuracy optimizer backfired in both datasets:
    gate-driven retries selected wording that satisfied a handful of examples
    but generalized worse. Goldens are a **regression gate** against broken or

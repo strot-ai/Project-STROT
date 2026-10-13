@@ -132,6 +132,7 @@ def cache_key(
     mode: str = "decision",
     golden: Optional[Any] = None,
     target_risk: Optional[float] = None,
+    measure_labels: bool = False,
 ) -> str:
     from . import __version__
 
@@ -146,6 +147,7 @@ def cache_key(
         "schema": schema_fingerprint(schema),
         "golden": golden,
         "target_risk": target_risk,
+        "measure_labels": measure_labels,
     }
     canonical = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -230,6 +232,7 @@ def run(
     execute: bool = True,
     golden: Optional[List[Mapping[str, Any]]] = None,
     target_risk: Optional[float] = None,
+    measure_labels: Optional[bool] = None,
 ) -> RunResult:
     """Process ``data`` against ``query``, JIT-compiling the pipeline on first use.
 
@@ -271,6 +274,12 @@ def run(
             conditional-on-dispatch error is bounded by alpha/dispatch_rate
             (estimated in the calibration metadata). Requires the decision
             runtime on the compile box.
+        measure_labels: Score the synthesized routing labels against the bare
+            registry keys on the teacher-labeled sample and bake the winner -
+            measurement instead of guessing. Defaults to ON whenever
+            target_risk is set (the teacher labels are already paid for);
+            pass True to enable it alone (triggers one teacher call) or
+            False to disable.
     """
     if not action_registry:
         raise RouterConfigurationError(
@@ -283,9 +292,10 @@ def run(
     schema = introspect_schema(sample)
     if golden is not None:
         StrotCompiler.validate_golden_run(golden, action_registry)
+    effective_measure = (target_risk is not None) if measure_labels is None else measure_labels
     key = cache_key(
         query, action_registry, nlu, schema, question, confidence_threshold,
-        golden=golden, target_risk=target_risk,
+        golden=golden, target_risk=target_risk, measure_labels=effective_measure,
     )
     artifact_path, meta_path = _artifact_paths(state, key)
 
@@ -306,6 +316,7 @@ def run(
                 question=question,
                 golden=golden,
                 target_risk=target_risk,
+                measure_labels=effective_measure,
             )
         except Exception as exc:
             _log_episode(state, {
@@ -320,6 +331,7 @@ def run(
             "query": query, "actions": list(action_registry),
             "golden_count": len(golden or []), "target_risk": target_risk,
             "attempts": asset.attempts, "calibration": asset.calibration,
+            "label_search": asset.label_search,
         })
         attempts = asset.attempts
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,6 +347,7 @@ def run(
                     "action_registry": dict(action_registry),
                     "schema": schema_fingerprint(schema),
                     "calibration": asset.calibration,
+                    "label_search": asset.label_search,
                 },
                 indent=2,
             ),

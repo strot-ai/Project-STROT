@@ -46,8 +46,10 @@ A cache miss in `run()`/`decide()` triggers this sequence:
 2. **Synthesis** — the LLM produces the configuration contract: routing labels, state projection, handlers (`run()`), or expanded criteria/rubrics (`decide()`).
 3. **Validation / repair loop** — each candidate is checked: AST parse, exact contract (function names, label keys match the registry), and a security lint (ML packages plus stdlib I/O / network / process / dynamic-execution imports and calls are rejected). Failures feed back verbatim; the LLM retries within `max_retries`. **The lint is validation, not a sandbox**: the golden gate `exec()`s candidates on the compile box, so compiling fully untrusted intent requires external isolation (container, locked-down user, resource limits).
 4. **Golden gate** — if `golden=` is provided, the assembled artifact is *executed* against your known-answer records. Any mismatch is a validation failure: the error (expected vs got, with confidence) feeds the repair loop. Only an artifact for which every expectation holds is promoted.
-5. **Teacher labeling + calibration** — if `target_risk=` is set, the LLM annotates the real sample records once; temperature and a conformal quantile are fitted on the promoted artifact's own output distributions and baked in. The golden gate re-runs on the calibrated artifact.
-6. **Persistence** — the artifact (`strot_<key>.py`) and its metadata (`strot_<key>.json`) land in the `state` directory; the compile is appended to `episodes.jsonl`.
+5. **Teacher labeling** — if `target_risk=` or `measure_labels=` is set, the LLM annotates the real sample records once (one call, shared by both features).
+6. **Measured label search** — the synthesized routing labels and the bare registry keys are both scored on the teacher-labeled sample through the actual artifact; the winner is baked in (measurement instead of guessing — benchmarks showed synthesis wins when integration is the bottleneck and loses when the keys are already optimal). A winner that breaks the goldens is rejected, keeping the synthesized labels; scores land in `label_search` metadata.
+7. **Calibration** — if `target_risk=` is set, temperature and a conformal quantile are fitted on the final artifact's output distributions and baked in. The golden gate re-runs on the calibrated artifact.
+8. **Persistence** — the artifact (`strot_<key>.py`) and its metadata (`strot_<key>.json`) land in the `state` directory; the compile is appended to `episodes.jsonl`.
 
 Every later call with the same cache key loads the artifact and executes — zero LLM involvement.
 
@@ -132,6 +134,7 @@ Semantics worth knowing:
 | `confidence_threshold` | 0.40 | fallback bar (uncalibrated artifacts) |
 | `golden` | None | promotion gate records |
 | `target_risk` | None | α for the fitted conformal guarantee |
+| `measure_labels` | None | score synthesized labels vs bare registry keys on the teacher-labeled sample, keep the winner; defaults ON when `target_risk` is set |
 | `execute` | True | False = warm the cache only (no runtime needed) |
 
 Returns `RunResult`: `outcomes` (list of `{index, record, action, confidence, result}`), `fallbacks` (`{index, record, confidence, reason}`), `pipeline` (live, for streaming single records), `cache_hit`, `attempts`, `artifact_path`, `summary()`.
