@@ -130,6 +130,7 @@ def cache_key(
     question: Optional[str],
     confidence_threshold: float,
     mode: str = "decision",
+    golden: Optional[Any] = None,
 ) -> str:
     from . import __version__
 
@@ -142,6 +143,7 @@ def cache_key(
         "question": question,
         "threshold": confidence_threshold,
         "schema": schema_fingerprint(schema),
+        "golden": golden,
     }
     canonical = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -205,6 +207,7 @@ def run(
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     question: Optional[str] = None,
     execute: bool = True,
+    golden: Optional[List[Mapping[str, Any]]] = None,
 ) -> RunResult:
     """Process ``data`` against ``query``, JIT-compiling the pipeline on first use.
 
@@ -231,6 +234,12 @@ def run(
         execute: If False, only ensure the artifact exists (warm the cache)
             without loading the runtime — useful on boxes without the runtime
             extras installed.
+        golden: Optional known-answer records
+            (``[{"record": {...}, "expect": "<action key>"}, ...]``) — the
+            promotion gate. Candidate artifacts are executed against them
+            inside the compile repair loop; only an artifact for which every
+            expectation holds is persisted and served. Requires the decision
+            runtime on the compile box.
     """
     if not action_registry:
         raise RouterConfigurationError(
@@ -241,8 +250,11 @@ def run(
     records = as_records(data)
     sample = records[:sample_size]
     schema = introspect_schema(sample)
+    if golden is not None:
+        StrotCompiler.validate_golden_run(golden, action_registry)
     key = cache_key(
-        query, action_registry, nlu, schema, question, confidence_threshold
+        query, action_registry, nlu, schema, question, confidence_threshold,
+        golden=golden,
     )
     artifact_path, meta_path = _artifact_paths(state, key)
 
@@ -260,6 +272,7 @@ def run(
             goal=query,
             action_registry=action_registry,
             question=question,
+            golden=golden,
         )
         attempts = asset.attempts
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -318,6 +331,7 @@ def decide(
     sample_size: int = 25,
     max_retries: int = 3,
     execute: bool = True,
+    golden: Optional[List[Mapping[str, Any]]] = None,
 ) -> RunResult:
     """Answer a typed-question decision config over every record.
 
@@ -349,13 +363,16 @@ def decide(
     if isinstance(questions, Mapping) and isinstance(questions.get("questions"), Mapping):
         questions = questions["questions"]  # accept a full config object with a questions key
     StrotCompiler.validate_questions_config(questions)
+    if golden is not None:
+        StrotCompiler.validate_golden_decide(golden, questions)
 
     records = as_records(data)
     sample = records[:sample_size]
     schema = introspect_schema(sample)
     canonical_config = json.dumps(questions, sort_keys=True)
     key = cache_key(
-        canonical_config, None, nlu, schema, None, 0.0, mode="decide"
+        canonical_config, None, nlu, schema, None, 0.0, mode="decide",
+        golden=golden,
     )
     artifact_path, meta_path = _artifact_paths(state, key)
 
@@ -367,7 +384,7 @@ def decide(
             llm_client=_resolve_llm(llm),
             max_retries=max_retries,
         )
-        asset = compiler.compile_decide(sample=sample, questions=questions)
+        asset = compiler.compile_decide(sample=sample, questions=questions, golden=golden)
         attempts = asset.attempts
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         asset.save(artifact_path)

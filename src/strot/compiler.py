@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import types as _types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Union
@@ -377,12 +378,90 @@ class StrotCompiler:
     # Assembly of the standalone asset                                    #
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    # Golden-record promotion gate                                        #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _load_candidate_module(source: str) -> Any:
+        """Exec a candidate asset in-memory for the golden gate.
+
+        A load failure here is an environment problem (missing decision
+        runtime on the compile box), never the synthesizer's fault - raise
+        instead of burning repair-loop retries.
+        """
+        import sys
+
+        module = _types.ModuleType("strot_golden_gate")
+        # Registered so stdlib machinery (e.g. dataclasses) can resolve the
+        # module during exec; dropped again by the gate methods when done.
+        sys.modules["strot_golden_gate"] = module
+        try:
+            exec(compile(source, "<strot-golden-gate>", "exec"), module.__dict__)
+        except Exception as exc:
+            sys.modules.pop("strot_golden_gate", None)
+            raise RouterConfigurationError(
+                "Golden-record gate could not load the candidate asset; the "
+                f"decision runtime must be installed on the compile box: {exc}"
+            ) from exc
+        return module
+
+    @staticmethod
+    def validate_golden_run(golden: Any, action_registry: Mapping[str, str]) -> None:
+        if not isinstance(golden, list) or not golden:
+            raise RouterConfigurationError("golden must be a non-empty list.")
+        for i, case in enumerate(golden):
+            if (
+                not isinstance(case, Mapping)
+                or not isinstance(case.get("record"), Mapping)
+                or case.get("expect") not in action_registry
+            ):
+                raise RouterConfigurationError(
+                    f"golden[{i}] must be {{'record': {{...}}, 'expect': <action key>}} "
+                    f"with expect one of {list(action_registry)}."
+                )
+
+    def _test_golden_pipeline(self, source: str, golden: List[Mapping[str, Any]]) -> Optional[str]:
+        import sys
+
+        module = self._load_candidate_module(source)
+        try:
+            pipeline = module.CompiledPipeline()
+        except Exception as exc:
+            raise RouterConfigurationError(
+                f"Golden-record gate: decision runtime failed to initialize: {exc}"
+            ) from exc
+        failures = []
+        for i, case in enumerate(golden):
+            expect = case["expect"]
+            try:
+                outcome = pipeline.process(dict(case["record"]))
+            except module.FallbackException as exc:
+                failures.append(
+                    f"golden[{i}] fell to fallback (confidence {exc.confidence:.2f}) "
+                    f"but expected action {expect!r}"
+                )
+                continue
+            if outcome["action"] != expect:
+                failures.append(
+                    f"golden[{i}] decided {outcome['action']!r} (confidence "
+                    f"{outcome['confidence']:.2f}) but expected {expect!r}"
+                )
+        sys.modules.pop("strot_golden_gate", None)
+        if failures:
+            return (
+                "Golden-record promotion gate failed - adjust ROUTING_LABELS and "
+                "route_context so these known answers hold:\n" + "\n".join(failures)
+            )
+        return None
+
     def compile(
         self,
         sample: Any,
         goal: str,
         action_registry: Mapping[str, str],
         question: Optional[str] = None,
+        golden: Optional[List[Mapping[str, Any]]] = None,
     ) -> CompiledAsset:
         """Run the full compile-time pipeline and return the production asset.
 
@@ -394,9 +473,16 @@ class StrotCompiler:
                 list position defines the routing option index at runtime.
             question: Optional override for the dynamic selection question
                 baked into the asset.
+            golden: Optional known-answer records
+                (``[{"record": {...}, "expect": "<action key>"}, ...]``). A
+                candidate asset is executed against them inside the repair
+                loop and only promoted if every expectation holds. Requires
+                the decision runtime on the compile box.
         """
         if not action_registry:
             raise CompilationError("action_registry must contain at least one action.", attempts=0)
+        if golden is not None:
+            self.validate_golden_run(golden, action_registry)
         schema = introspect_schema(sample)
         expected = [handler_name(key) for key in action_registry]
         if len(set(expected)) != len(expected):
@@ -405,18 +491,26 @@ class StrotCompiler:
             )
         expected = expected + ["route_context"]
         prompt = self.build_synthesis_prompt(schema, goal, action_registry)
-        generated_paths, attempts = self._synthesize_paths(
-            prompt, expected, label_keys=list(action_registry)
-        )
-        source = self._assemble(schema, goal, dict(action_registry), generated_paths, question)
-        try:
-            ast.parse(source)
-        except SyntaxError as exc:  # template regression guard
-            raise CompilationError(
-                f"Assembled asset failed final syntax validation: {exc}",
-                attempts=attempts,
-                last_error=str(exc),
-            ) from exc
+        promoted: Dict[str, str] = {}
+
+        def validate(code: str) -> Optional[str]:
+            error = self._validate_candidate(code, expected, list(action_registry))
+            if error:
+                return error
+            source = self._assemble(schema, goal, dict(action_registry), code, question)
+            try:
+                ast.parse(source)
+            except SyntaxError as exc:  # template regression guard
+                return f"Assembled asset failed syntax validation: {exc}"
+            if golden:
+                error = self._test_golden_pipeline(source, golden)
+                if error:
+                    return error
+            promoted["source"] = source
+            return None
+
+        _, attempts = self._synthesize_with(prompt, validate)
+        source = promoted["source"]
         return CompiledAsset(
             source=source,
             nlu_model=self.nlu_model,
@@ -566,13 +660,115 @@ class StrotCompiler:
                     )
         return None
 
-    def compile_decide(self, sample: Any, questions: Mapping[str, Any]) -> CompiledAsset:
+    @staticmethod
+    def validate_golden_decide(golden: Any, questions: Mapping[str, Any]) -> None:
+        if not isinstance(golden, list) or not golden:
+            raise RouterConfigurationError("golden must be a non-empty list.")
+        for i, case in enumerate(golden):
+            if (
+                not isinstance(case, Mapping)
+                or not isinstance(case.get("record"), Mapping)
+                or not isinstance(case.get("expect"), Mapping)
+                or not case["expect"]
+            ):
+                raise RouterConfigurationError(
+                    f"golden[{i}] must be {{'record': {{...}}, 'expect': "
+                    "{<question>: <expected>}}."
+                )
+            for qname, expected in case["expect"].items():
+                spec = questions.get(qname)
+                if spec is None:
+                    raise RouterConfigurationError(
+                        f"golden[{i}]: unknown question {qname!r}."
+                    )
+                if spec["type"] == "choice" and expected not in spec["options"]:
+                    raise RouterConfigurationError(
+                        f"golden[{i}].{qname}: expected must be one of {spec['options']}."
+                    )
+                if spec["type"] == "noul" and not isinstance(expected, bool):
+                    raise RouterConfigurationError(
+                        f"golden[{i}].{qname}: noul expectation must be true/false."
+                    )
+                if spec["type"] == "score":
+                    is_range = (
+                        isinstance(expected, (list, tuple))
+                        and len(expected) == 2
+                        and all(isinstance(v, (int, float)) for v in expected)
+                    )
+                    if not is_range and not isinstance(expected, (int, float)):
+                        raise RouterConfigurationError(
+                            f"golden[{i}].{qname}: score expectation must be a "
+                            "number or [low, high] range."
+                        )
+
+    def _test_golden_decider(
+        self,
+        source: str,
+        golden: List[Mapping[str, Any]],
+        questions: Mapping[str, Any],
+    ) -> Optional[str]:
+        import sys
+
+        module = self._load_candidate_module(source)
+        try:
+            decider = module.CompiledDecider()
+        except Exception as exc:
+            raise RouterConfigurationError(
+                f"Golden-record gate: decision runtime failed to initialize: {exc}"
+            ) from exc
+        failures = []
+        for i, case in enumerate(golden):
+            decision = decider.process(dict(case["record"]))
+            for qname, expected in case["expect"].items():
+                qtype = questions[qname]["type"]
+                if qtype == "choice":
+                    got = decision["choices"][qname]["selected"]
+                    if got != expected:
+                        failures.append(
+                            f"golden[{i}].{qname}: selected {got!r}, expected {expected!r}"
+                        )
+                elif qtype == "noul":
+                    p = decision["nouls"][qname]["noul"]
+                    if (p >= 0.5) != expected:
+                        failures.append(
+                            f"golden[{i}].{qname}: noul={p:.2f}, expected "
+                            f"{'true' if expected else 'false'}"
+                        )
+                else:  # score
+                    value = decision["scores"][qname]["value"]
+                    low, high = (
+                        expected
+                        if isinstance(expected, (list, tuple))
+                        else (expected - 0.5, expected + 0.5)
+                    )
+                    if not low <= value <= high:
+                        failures.append(
+                            f"golden[{i}].{qname}: value={value}, expected "
+                            f"within [{low}, {high}]"
+                        )
+        sys.modules.pop("strot_golden_gate", None)
+        if failures:
+            return (
+                "Golden-record promotion gate failed - adjust the criteria, "
+                "rubrics, and route_context so these known answers hold:\n"
+                + "\n".join(failures)
+            )
+        return None
+
+    def compile_decide(
+        self,
+        sample: Any,
+        questions: Mapping[str, Any],
+        golden: Optional[List[Mapping[str, Any]]] = None,
+    ) -> CompiledAsset:
         """Decide mode: compile a typed-question decision config.
 
         The synthesis agent expands the config (criteria descriptions, score
         rubrics, noul case descriptions) against the verified schema and
         writes the state projection; the local decision model answers all
-        questions per record at runtime in one batched pass.
+        questions per record at runtime in one batched pass. With ``golden``,
+        candidates are executed against known-answer records inside the
+        repair loop and only promoted when every expectation holds.
         """
         if self.runtime_kind != "local":
             raise RouterConfigurationError(
@@ -580,32 +776,40 @@ class StrotCompiler:
                 f"(got {self.nlu_model!r})."
             )
         self.validate_questions_config(questions)
+        if golden is not None:
+            self.validate_golden_decide(golden, questions)
         schema = introspect_schema(sample)
         prompt = self.build_decide_prompt(schema, questions)
-        generated, attempts = self._synthesize_with(
-            prompt, lambda code: self._validate_decide_candidate(code, questions)
+        header = templates.DECIDE_HEADER_TEMPLATE.format(
+            nlu_model=self.nlu_model,
+            schema_literal=repr(schema.to_dict()),
+            config_literal=repr(dict(questions)),
         )
-        source = (
-            "\n\n".join(
-                [
-                    templates.DECIDE_HEADER_TEMPLATE.format(
-                        nlu_model=self.nlu_model,
-                        schema_literal=repr(schema.to_dict()),
-                        config_literal=repr(dict(questions)),
-                    ),
-                    templates.DECIDE_FOOTER_TEMPLATE.format(generated_paths=generated),
-                ]
+        promoted: Dict[str, str] = {}
+
+        def validate(code: str) -> Optional[str]:
+            error = self._validate_decide_candidate(code, questions)
+            if error:
+                return error
+            source = (
+                "\n\n".join(
+                    [header, templates.DECIDE_FOOTER_TEMPLATE.format(generated_paths=code)]
+                )
+                + "\n"
             )
-            + "\n"
-        )
-        try:
-            ast.parse(source)
-        except SyntaxError as exc:  # template regression guard
-            raise CompilationError(
-                f"Assembled decision asset failed final syntax validation: {exc}",
-                attempts=attempts,
-                last_error=str(exc),
-            ) from exc
+            try:
+                ast.parse(source)
+            except SyntaxError as exc:  # template regression guard
+                return f"Assembled decision asset failed syntax validation: {exc}"
+            if golden:
+                error = self._test_golden_decider(source, golden, questions)
+                if error:
+                    return error
+            promoted["source"] = source
+            return None
+
+        _, attempts = self._synthesize_with(prompt, validate)
+        source = promoted["source"]
         return CompiledAsset(
             source=source,
             nlu_model=self.nlu_model,

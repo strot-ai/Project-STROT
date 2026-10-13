@@ -299,6 +299,41 @@ class TestRun:
         assert result.pipeline is None
         assert result.outcomes == []
 
+    def test_golden_gate_promotes_passing_artifact(self, tmp_path, fake_runtime):
+        golden = [
+            {"record": SAMPLE[0], "expect": "billing"},
+            {"record": SAMPLE[1], "expect": "defect"},
+        ]
+        llm = ScriptedLLM([VALID_PATHS])
+        result = strot.run(SAMPLE, QUERY, REGISTRY, llm=llm, state=tmp_path, golden=golden)
+        assert result.attempts == 1
+        assert len(result.outcomes) == 2
+
+    def test_golden_gate_rejects_misrouting_artifact_and_repairs(self, tmp_path, fake_runtime):
+        swapped = VALID_PATHS.replace(
+            'ROUTING_LABELS = {"billing": "billing", "defect": "defect"}',
+            'ROUTING_LABELS = {"billing": "defect", "defect": "billing"}',
+        )
+        llm = ScriptedLLM([swapped, VALID_PATHS])
+        golden = [{"record": SAMPLE[0], "expect": "billing"}]
+        result = strot.run(SAMPLE, QUERY, REGISTRY, llm=llm, state=tmp_path, golden=golden)
+        assert result.attempts == 2
+        routed = {o["record"]["ticket_id"]: o["action"] for o in result.outcomes}
+        assert routed == {1: "billing", 2: "defect"}
+
+    def test_golden_validation_before_llm(self, tmp_path):
+        golden = [{"record": SAMPLE[0], "expect": "not_an_action"}]
+        with pytest.raises(RouterConfigurationError, match="expect"):
+            strot.run(SAMPLE, QUERY, REGISTRY, llm=ExplodingLLM(), state=tmp_path, golden=golden)
+
+    def test_golden_is_part_of_cache_key(self, tmp_path, fake_runtime):
+        plain = strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path)
+        golden = [{"record": SAMPLE[0], "expect": "billing"}]
+        gated = strot.run(
+            SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path, golden=golden
+        )
+        assert plain.cache_key != gated.cache_key
+
     def test_summary_counts_actions(self, tmp_path, fake_runtime):
         result = strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path)
         summary = result.summary()
@@ -374,6 +409,23 @@ class TestDecide:
         bad = {"q": {"type": "score", "min": 1, "max": 99, "instructions": "x"}}
         with pytest.raises(RouterConfigurationError, match="2-20"):
             strot.decide(SAMPLE, bad, llm=ExplodingLLM(), state=tmp_path)
+
+    def test_decide_golden_gate_rejects_and_repairs(self, tmp_path, fake_runtime):
+        swapped = VALID_DECIDE.replace(
+            '"billing": "billing charge payment"', '"billing": "crash defect bug"'
+        ).replace(
+            '"engineering": "crash defect bug"', '"engineering": "billing charge payment"'
+        )
+        llm = ScriptedLLM([swapped, VALID_DECIDE])
+        golden = [{"record": SAMPLE[1], "expect": {"team": "engineering", "is_bug": True}}]
+        result = strot.decide(SAMPLE, DECIDE_CONFIG, llm=llm, state=tmp_path, golden=golden)
+        assert result.attempts == 2
+        assert result.outcomes[1]["decision"]["choices"]["team"]["selected"] == "engineering"
+
+    def test_decide_golden_validation_before_llm(self, tmp_path):
+        golden = [{"record": SAMPLE[0], "expect": {"nope": "billing"}}]
+        with pytest.raises(RouterConfigurationError, match="unknown question"):
+            strot.decide(SAMPLE, DECIDE_CONFIG, llm=ExplodingLLM(), state=tmp_path, golden=golden)
 
     def test_decide_expansion_errors_feed_repair_loop(self, tmp_path, fake_runtime):
         missing_rubric = VALID_DECIDE.replace(
