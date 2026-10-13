@@ -18,7 +18,6 @@ import pytest
 import strot
 from strot.exceptions import RouterConfigurationError, SchemaIntrospectionError
 
-HAS_DUCKDB = importlib.util.find_spec("duckdb") is not None
 from strot.jit import as_records, cache_key, schema_fingerprint
 from strot.schema import introspect_schema
 
@@ -309,70 +308,6 @@ class TestRun:
     def test_unresolvable_llm_spec_raises(self, tmp_path):
         with pytest.raises(RouterConfigurationError):
             strot.run(SAMPLE, QUERY, REGISTRY, llm=12345, state=tmp_path)
-
-    @pytest.mark.skipif(not HAS_DUCKDB, reason="research mode requires duckdb")
-    def test_research_mode_computes_analysis_without_runtime_model(self, tmp_path):
-        plan = '''```python
-PLAN = [
-    {"name": "ticket_count", "tool": "count_records", "params": {}},
-    {"name": "tiers", "tool": "value_counts", "params": {"column": "tier"}},
-]
-```'''
-        llm = ScriptedLLM([plan])
-        result = strot.run(SAMPLE, QUERY, llm=llm, state=tmp_path, mode="research")
-        assert llm.calls == 1
-        assert result.mode == "research"
-        assert result.analysis == {
-            "ticket_count": 2,
-            "tiers": [{"value": "free", "count": 1}, {"value": "pro", "count": 1}],
-        }
-        assert result.summary()["mode"] == "research"
-        # Warm call: no LLM, no model runtime, identical computed output.
-        warm = strot.run(SAMPLE, QUERY, llm=ExplodingLLM(), state=tmp_path, mode="research")
-        assert warm.cache_hit is True
-        assert warm.analysis == result.analysis
-
-    @pytest.mark.skipif(not HAS_DUCKDB, reason="research mode requires duckdb")
-    def test_research_plan_errors_feed_repair_loop(self, tmp_path):
-        bad_then_good = ScriptedLLM(
-            [
-                '```python\nPLAN = [{"name": "x", "tool": "nope", "params": {}}]\n```',
-                '```python\nPLAN = [{"name": "n", "tool": "count_records", "params": {}}]\n```',
-            ]
-        )
-        result = strot.run(SAMPLE, QUERY, llm=bad_then_good, state=tmp_path, mode="research")
-        assert result.attempts == 2
-        assert result.analysis == {"n": 2}
-
-    @pytest.mark.skipif(not HAS_DUCKDB, reason="research mode requires duckdb")
-    def test_mode_is_part_of_the_cache_key(self, tmp_path, fake_runtime):
-        decision = strot.run(
-            SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path
-        )
-        research = strot.run(
-            SAMPLE,
-            QUERY,
-            llm=ScriptedLLM(
-                ['```python\nPLAN = [{"name": "n", "tool": "count_records", "params": {}}]\n```']
-            ),
-            state=tmp_path,
-            mode="research",
-        )
-        assert decision.cache_key != research.cache_key
-
-    def test_decision_mode_requires_registry(self, tmp_path):
-        with pytest.raises(RouterConfigurationError, match="action_registry"):
-            strot.run(SAMPLE, QUERY, llm=ExplodingLLM(), state=tmp_path)
-
-    def test_research_mode_rejects_registry(self, tmp_path):
-        with pytest.raises(RouterConfigurationError, match="research"):
-            strot.run(
-                SAMPLE, QUERY, REGISTRY, llm=ExplodingLLM(), state=tmp_path, mode="research"
-            )
-
-    def test_unknown_mode_rejected(self, tmp_path):
-        with pytest.raises(RouterConfigurationError, match="mode"):
-            strot.run(SAMPLE, QUERY, REGISTRY, llm=ExplodingLLM(), state=tmp_path, mode="chat")
 
     def test_anthropic_spec_requires_extra_when_missing(self, tmp_path):
         if importlib.util.find_spec("anthropic") is not None:

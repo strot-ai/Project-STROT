@@ -57,20 +57,12 @@ class RunResult:
     pipeline: Any = None  #: live CompiledPipeline for streaming further records
     attempts: int = 0  #: synthesizer attempts (0 on a cache hit)
     mode: str = "decision"
-    analysis: Optional[Dict[str, Any]] = None  #: research-mode computed insights
 
     def summary(self) -> Dict[str, Any]:
         if self.mode == "decide":
             return {
                 "mode": "decide",
                 "processed": len(self.outcomes),
-                "cache_hit": self.cache_hit,
-                "artifact": str(self.artifact_path),
-            }
-        if self.mode == "research":
-            return {
-                "mode": "research",
-                "insight_keys": list(self.analysis or {}),
                 "cache_hit": self.cache_hit,
                 "artifact": str(self.artifact_path),
             }
@@ -204,7 +196,7 @@ def _load_artifact(path: Path, key: str) -> Any:
 def run(
     data: Any,
     query: str,
-    action_registry: Optional[Mapping[str, str]] = None,
+    action_registry: Mapping[str, str],
     llm: LLMSpec = "openai/gpt-4o",
     nlu: str = DEFAULT_NLU_MODEL,
     state: Union[str, Path] = ".strot",
@@ -213,62 +205,44 @@ def run(
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
     question: Optional[str] = None,
     execute: bool = True,
-    mode: str = "decision",
 ) -> RunResult:
     """Process ``data`` against ``query``, JIT-compiling the pipeline on first use.
 
-    Two modes, one philosophy — the LLM is confined to compile time:
-
-    * ``mode="decision"`` — per-record typed decisions. The final arbiter at
-      runtime is the ML decision model (``nlu``): output is bounded,
-      type-safe JSON (action, probabilities, confidence) with the compiled
-      handlers executing the chosen path. Requires ``action_registry``.
-    * ``mode="research"`` — the LLM synthesizes analysis code against the
-      schema once; execution is model-free and every value in
-      ``result.analysis`` is computed from the records, never generated.
+    STROT is a decision system — the LLM is confined to compile time. At
+    runtime the final arbiter is the ML decision model (``nlu``): output is
+    bounded, type-safe JSON (action, probabilities, confidence) with the
+    compiled handlers executing the chosen path.
 
     Args:
         data: The dataset — DataFrame-like, list of dict records, or dict of
             column lists. The first ``sample_size`` records also serve as the
             synthesis/validation sample on a cache miss.
         query: The functional goal in natural language (the paper's ``goal``).
-        action_registry: Decision mode only — ordered mapping of action key ->
-            description; defines the decision space enforced on the NLU model.
+        action_registry: Ordered mapping of action key -> description; defines
+            the bounded decision space enforced on the ML decision model.
         llm: Synthesizer spec or callable; resolved lazily, only on cache miss.
-        nlu: Decision mode only — runtime decision model baked into the asset.
+        nlu: Runtime decision model baked into the asset (local or hosted).
         state: Artifact-store directory — the persisted "compiled flag + code".
         sample_size: Records used for schema profiling and synthesis grounding.
         max_retries: Feedback-driven synthesis budget on a cache miss.
-        confidence_threshold: Decision mode — routing confidence below this
-            raises the compiled asset's FallbackException instead of executing.
+        confidence_threshold: Routing confidence below this raises the
+            compiled asset's FallbackException instead of executing a path.
         question: Optional override of the routing question baked into the asset.
         execute: If False, only ensure the artifact exists (warm the cache)
             without loading the runtime — useful on boxes without the runtime
             extras installed.
-        mode: ``"decision"`` (default) or ``"research"``.
     """
-    if mode not in ("decision", "research"):
+    if not action_registry:
         raise RouterConfigurationError(
-            f"mode must be 'decision' or 'research', got {mode!r}."
-        )
-    if mode == "decision" and not action_registry:
-        raise RouterConfigurationError(
-            "mode='decision' requires an action_registry (the bounded decision "
-            "space enforced on the ML decision model)."
-        )
-    if mode == "research" and action_registry:
-        raise RouterConfigurationError(
-            "mode='research' takes no action_registry; the compiled analysis "
-            "has no routing decision."
+            "run() requires an action_registry (the bounded decision space "
+            "enforced on the ML decision model)."
         )
 
     records = as_records(data)
     sample = records[:sample_size]
     schema = introspect_schema(sample)
-    effective_nlu = nlu if mode == "decision" else "none"
     key = cache_key(
-        query, action_registry, effective_nlu, schema, question,
-        confidence_threshold, mode,
+        query, action_registry, nlu, schema, question, confidence_threshold
     )
     artifact_path, meta_path = _artifact_paths(state, key)
 
@@ -281,15 +255,12 @@ def run(
             max_retries=max_retries,
             confidence_threshold=confidence_threshold,
         )
-        if mode == "research":
-            asset: CompiledAsset = compiler.compile_research(sample=sample, goal=query)
-        else:
-            asset = compiler.compile(
-                sample=sample,
-                goal=query,
-                action_registry=action_registry,
-                question=question,
-            )
+        asset: CompiledAsset = compiler.compile(
+            sample=sample,
+            goal=query,
+            action_registry=action_registry,
+            question=question,
+        )
         attempts = asset.attempts
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         asset.save(artifact_path)
@@ -297,12 +268,11 @@ def run(
             json.dumps(
                 {
                     "cache_key": key,
-                    "mode": mode,
                     "query": query,
-                    "nlu": effective_nlu,
+                    "nlu": nlu,
                     "runtime_kind": asset.runtime_kind,
                     "attempts": asset.attempts,
-                    "action_registry": dict(action_registry or {}),
+                    "action_registry": dict(action_registry),
                     "schema": schema_fingerprint(schema),
                 },
                 indent=2,
@@ -317,17 +287,11 @@ def run(
         cache_hit=cache_hit,
         cache_key=key,
         attempts=attempts,
-        mode=mode,
     )
     if not execute:
         return result
 
     module = _load_artifact(artifact_path, key)
-    if mode == "research":
-        result.pipeline = module.CompiledAnalysis()
-        result.analysis = result.pipeline.process(records)
-        return result
-
     result.pipeline = module.CompiledPipeline()
     for index, record in enumerate(records):
         try:
