@@ -1,4 +1,5 @@
 import math
+import random
 
 import pytest
 
@@ -6,6 +7,7 @@ from strot.calibrate import (
     apply_temperature,
     calibration_report,
     conformal_quantile,
+    fit_split_calibration,
     fit_temperature,
     prediction_set,
 )
@@ -63,6 +65,64 @@ class TestConformal:
         assert report["n_calibration"] == 3
         assert 0.0 <= report["dispatch_rate_on_calibration"] <= 1.0
         assert report["quantile_granularity"] == 0.25
+
+
+def _draw(rng, n):
+    """Synthetic 3-class generative process with mixed difficulty."""
+    distributions, truths = [], []
+    for _ in range(n):
+        true = rng.randrange(3)
+        concentration = rng.choice([0.6, 0.9, 2.5, 5.0])
+        logits = [rng.gauss(0, 1) for _ in range(3)]
+        logits[true] += concentration
+        peak = max(logits)
+        exps = [math.exp(x - peak) for x in logits]
+        total = sum(exps)
+        distributions.append([x / total for x in exps])
+        truths.append(true)
+    return distributions, truths
+
+
+class TestSplitCalibration:
+    def test_folds_are_disjoint_and_reported(self):
+        distributions = [[0.9, 0.1]] * 10
+        truths = [0] * 10
+        report = fit_split_calibration(distributions, truths, alpha=0.2)
+        assert report["n_calibration"] == 10
+        assert report["n_temperature_fold"] == 5
+        assert report["n_conformal_fold"] == 5
+        assert report["quantile_granularity"] == round(1 / 6, 4)
+        assert "marginal" in report["guarantee"]
+
+    def test_tiny_temperature_fold_falls_back_to_t1(self):
+        distributions = [[0.8, 0.2]] * 4  # T-fold gets 2 points (< 4)
+        report = fit_split_calibration(distributions, [0] * 4, alpha=0.4)
+        assert report["temperature"] == 1.0
+
+    def test_conditional_bound_reported(self):
+        distributions = [[0.95, 0.05]] * 20
+        report = fit_split_calibration(distributions, [0] * 20, alpha=0.2)
+        rate = report["dispatch_rate_on_calibration"]
+        if rate:
+            assert report["conditional_error_bound_estimate"] == round(
+                min(1.0, 0.2 / rate), 4
+            )
+
+    def test_empirical_marginal_coverage_holds(self):
+        # Fit on 300 points, evaluate wrong-dispatch rate on 2000 fresh points
+        # from the same process: must stay within alpha (+ finite-sample slack).
+        rng = random.Random(7)
+        cal_d, cal_y = _draw(rng, 300)
+        test_d, test_y = _draw(rng, 2000)
+        alpha = 0.1
+        report = fit_split_calibration(cal_d, cal_y, alpha=alpha)
+        t, q = report["temperature"], report["conformal_quantile"]
+        wrong_dispatches = 0
+        for probs, true in zip(test_d, test_y):
+            included, _ = prediction_set(probs, t, q)
+            if len(included) == 1 and included[0] != true:
+                wrong_dispatches += 1
+        assert wrong_dispatches / len(test_d) <= alpha + 0.02
 
 
 class TestGuards:

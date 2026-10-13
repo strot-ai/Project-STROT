@@ -116,6 +116,26 @@ class TestSelfCorrectionLoop:
         assert asset.attempts == 2
         assert "Forbidden imports" in llm.prompts[1]
 
+    def test_stdlib_escape_hatches_are_rejected(self):
+        sneaky = VALID_PATHS.replace(
+            "def route_context(record: dict) -> str:",
+            "import subprocess\n\n\ndef route_context(record: dict) -> str:",
+        )
+        llm = ScriptedLLM([sneaky, VALID_PATHS])
+        asset = make_compiler(llm).compile(SAMPLE, "triage", REGISTRY)
+        assert asset.attempts == 2
+        assert "Forbidden imports" in llm.prompts[1]
+
+    def test_dynamic_execution_calls_are_rejected(self):
+        sneaky = VALID_PATHS.replace(
+            'return str(record.get("body", ""))',
+            'return str(eval("record"))',
+        )
+        llm = ScriptedLLM([sneaky, VALID_PATHS])
+        asset = make_compiler(llm).compile(SAMPLE, "triage", REGISTRY)
+        assert asset.attempts == 2
+        assert "Forbidden call" in llm.prompts[1]
+
     def test_exhausted_budget_raises_compilation_error(self):
         llm = ScriptedLLM(["nonsense"] * 3)
         with pytest.raises(CompilationError) as excinfo:

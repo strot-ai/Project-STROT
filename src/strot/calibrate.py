@@ -11,10 +11,23 @@ from teacher-labeled sample records and baked into the artifact as constants:
   (``1 - p_T(true label)``) at miscoverage level ``alpha``. At runtime the
   artifact forms the prediction set ``{label : p_T(label) >= 1 - q}`` and
   dispatches only when that set is a singleton; otherwise it falls back.
-  This carries the standard split-conformal marginal guarantee: the true
-  label lands in the prediction set with probability >= 1 - alpha (over
-  exchangeable data), so a singleton dispatch is wrong with probability
-  <= alpha, marginally.
+
+**Read the guarantee precisely.** Split conformal targets *marginal*
+coverage: under exchangeability, the true label lands in the prediction set
+with probability >= 1 - alpha. A wrong singleton dispatch implies the true
+label was outside the set, so the rate of wrong dispatches **over all
+incoming records** is bounded by alpha. The error rate *conditional on
+dispatching* is NOT bounded by alpha — it is bounded by
+``alpha / dispatch_rate`` (reported as an estimate in the calibration
+metadata). At a 90% dispatch rate the two nearly coincide; at a 20%
+dispatch rate the conditional rate may be 5x alpha.
+
+**Validity requires fold splitting.** The temperature transform must be
+fixed independently of the conformal calibration points, so
+:func:`fit_split_calibration` fits ``T`` on one fold and the quantile on a
+disjoint fold. Fitting both on the same points (as naive implementations
+do) makes the scores non-exchangeable with fresh records and voids the
+finite-sample guarantee.
 
 Everything here is pure Python on top of probabilities the runtime already
 produces — no torch, no new dependencies, honest small-sample caveats: with
@@ -96,6 +109,64 @@ def prediction_set(
     calibrated = apply_temperature(probs, temperature)
     included = [i for i, p in enumerate(calibrated) if p >= 1.0 - quantile]
     return included, calibrated
+
+
+def fit_split_calibration(
+    distributions: Sequence[Sequence[float]],
+    true_indices: Sequence[int],
+    alpha: float,
+) -> Dict[str, object]:
+    """Validity-preserving calibration: disjoint folds for T and the quantile.
+
+    Even-indexed points fit the temperature; odd-indexed points supply the
+    conformal quantile. With fewer than 4 temperature points, T falls back
+    to 1.0 (an uninformed fit is worse than none). With a single labeled
+    point overall, everything goes to the quantile fold.
+
+    Returns the full calibration report to bake into the artifact,
+    including honest fold sizes and the estimated conditional error bound.
+    """
+    if len(distributions) != len(true_indices) or not distributions:
+        raise ValueError("need equal, non-empty distributions and labels")
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be in (0, 1)")
+    t_dists, t_true = list(distributions[0::2]), list(true_indices[0::2])
+    c_dists, c_true = list(distributions[1::2]), list(true_indices[1::2])
+    if not c_dists:  # single labeled point: quantile fold takes it
+        c_dists, c_true = list(distributions), list(true_indices)
+        t_dists, t_true = [], []
+    temperature = fit_temperature(t_dists, t_true) if len(t_dists) >= 4 else 1.0
+    quantile = conformal_quantile(c_dists, c_true, temperature, alpha)
+
+    n_conformal = len(c_dists)
+    singleton = correct_singleton = 0
+    for probs, true_index in zip(c_dists, c_true):
+        included, _ = prediction_set(probs, temperature, quantile)
+        if len(included) == 1:
+            singleton += 1
+            if included[0] == true_index:
+                correct_singleton += 1
+    dispatch_rate = singleton / n_conformal if n_conformal else 0.0
+    return {
+        "n_calibration": len(distributions),
+        "n_temperature_fold": len(t_dists),
+        "n_conformal_fold": n_conformal,
+        "alpha": alpha,
+        "temperature": temperature,
+        "conformal_quantile": quantile,
+        "quantile_granularity": round(1.0 / (n_conformal + 1), 4),
+        "dispatch_rate_on_calibration": round(dispatch_rate, 4),
+        "dispatch_accuracy_on_calibration": (
+            round(correct_singleton / singleton, 4) if singleton else None
+        ),
+        "guarantee": (
+            "marginal: P(dispatch AND wrong) <= alpha over exchangeable "
+            "records; non-singleton prediction sets abstain"
+        ),
+        "conditional_error_bound_estimate": (
+            round(min(1.0, alpha / dispatch_rate), 4) if dispatch_rate > 0 else None
+        ),
+    }
 
 
 def calibration_report(

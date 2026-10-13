@@ -264,10 +264,13 @@ def run(
             runtime on the compile box.
         target_risk: Optional miscoverage level ``alpha`` (e.g. 0.05). Fits
             temperature scaling + a split-conformal threshold from an
-            LLM-teacher-labeled sample at compile time; the artifact then
-            dispatches only on singleton prediction sets, carrying a marginal
-            guarantee that a dispatched decision is wrong with probability
-            <= alpha. Requires the decision runtime on the compile box.
+            LLM-teacher-labeled sample at compile time (disjoint folds
+            preserve conformal validity); the artifact then dispatches only
+            on singleton prediction sets. The guarantee is MARGINAL: wrong
+            dispatches are <= alpha of ALL records under exchangeability;
+            conditional-on-dispatch error is bounded by alpha/dispatch_rate
+            (estimated in the calibration metadata). Requires the decision
+            runtime on the compile box.
     """
     if not action_registry:
         raise RouterConfigurationError(

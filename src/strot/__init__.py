@@ -35,7 +35,7 @@ from .router import (
 )
 from .schema import DatasetSchema, FieldProfile, SchemaProfiler, introspect_schema
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 from .jit import RunResult, decide, run  # noqa: E402  (needs __version__ for cache keys)
 from .prefetch import prefetch_nlu  # noqa: E402

@@ -44,7 +44,7 @@ A cache miss in `run()`/`decide()` triggers this sequence:
 
 1. **Schema profiling** — the sample (first `sample_size` records) is introspected into a verified schema: field names, semantic types, null rates, example values. This grounds every prompt.
 2. **Synthesis** — the LLM produces the configuration contract: routing labels, state projection, handlers (`run()`), or expanded criteria/rubrics (`decide()`).
-3. **Validation / repair loop** — each candidate is checked: AST parse, exact contract (function names, label keys match the registry), forbidden imports. Failures feed back verbatim; the LLM retries within `max_retries`.
+3. **Validation / repair loop** — each candidate is checked: AST parse, exact contract (function names, label keys match the registry), and a security lint (ML packages plus stdlib I/O / network / process / dynamic-execution imports and calls are rejected). Failures feed back verbatim; the LLM retries within `max_retries`. **The lint is validation, not a sandbox**: the golden gate `exec()`s candidates on the compile box, so compiling fully untrusted intent requires external isolation (container, locked-down user, resource limits).
 4. **Golden gate** — if `golden=` is provided, the assembled artifact is *executed* against your known-answer records. Any mismatch is a validation failure: the error (expected vs got, with confidence) feeds the repair loop. Only an artifact for which every expectation holds is promoted.
 5. **Teacher labeling + calibration** — if `target_risk=` is set, the LLM annotates the real sample records once; temperature and a conformal quantile are fitted on the promoted artifact's own output distributions and baked in. The golden gate re-runs on the calibrated artifact.
 6. **Persistence** — the artifact (`strot_<key>.py`) and its metadata (`strot_<key>.json`) land in the `state` directory; the compile is appended to `episodes.jsonl`.
@@ -101,15 +101,16 @@ Semantics worth knowing:
 `target_risk=0.1` buys you a fitted, quantified dispatch policy. What actually happens:
 
 1. The LLM teacher labels your real sample records (annotation of real data — never synthetic generation; conformal validity requires calibration points from the same distribution as runtime traffic).
-2. **Temperature scaling**: one scalar fitted by NLL so the model's probabilities mean what they say.
-3. **Split conformal quantile** at `alpha = target_risk`, over nonconformity scores `1 − p_T(true label)`, rounded conservatively upward.
-4. At runtime the artifact forms the prediction set `{label : p_T(label) ≥ 1 − q}` and **dispatches only on a singleton**; empty or multi-label sets raise `FallbackException`.
+2. The labeled points are **split into disjoint folds**: temperature is fitted on one, the conformal quantile on the other. This is required for validity — a score transform fitted on the quantile's own calibration points makes the scores non-exchangeable with fresh records.
+3. **Temperature scaling** (fold A): one scalar fitted by NLL so the model's probabilities mean what they say. Falls back to T=1 below 4 points.
+4. **Split conformal quantile** (fold B) at `alpha = target_risk`, over nonconformity scores `1 − p_T(true label)`, rounded conservatively upward.
+5. At runtime the artifact forms the prediction set `{label : p_T(label) ≥ 1 − q}` and **dispatches only on a singleton**; empty or multi-label sets raise `FallbackException`.
 
-**Read the guarantee precisely.** It is *marginal*: over exchangeable traffic, a dispatched decision is wrong with probability ≤ α **on average**. It is not a per-record promise — an individual ambiguous record can still dispatch (that consumes the α budget). Phrase it as "error rate ≤ α", never "every hard record abstains."
+**Read the guarantee precisely.** Split conformal targets **marginal coverage of at least 1−α under exchangeability**, with abstention on non-singleton prediction sets. Consequence: the rate of wrong dispatches **over all incoming records** is ≤ α. The error rate **conditional on dispatching** is *not* bounded by α — it is bounded by α / dispatch-rate, which the artifact reports as `conditional_error_bound_estimate` in its `CALIBRATION` metadata. At a 90% dispatch rate the two nearly coincide; at a 20% dispatch rate the conditional rate may reach 5α. Phrase claims as "wrong dispatches ≤ α of all records", never "≤ α of dispatched records."
 
 **Honest caveats, surfaced in `CALIBRATION` metadata:**
 
-- `quantile_granularity = 1/(n+1)`: with a 14-record sample the guarantee can't be finer than ~7%. Want α=0.01? You need ≥100 labeled sample records (`sample_size=100`).
+- `quantile_granularity = 1/(n_conformal+1)`: fold splitting halves the effective calibration set, so a 25-record sample yields ~12 conformal points (granularity ~8%). Want α=0.01? You need ≥200 labeled sample records (`sample_size=200`).
 - `temperature` pinned at the grid edge (0.25 or 4.0) means the calibration set was too easy or too hard to be informative — inspect it.
 - Teacher labels are LLM annotations: imperfect labels loosen the real guarantee. Production feedback (resolved fallbacks, corrections) is a better calibration source once you have it — refit by recompiling with it as goldens/sample.
 - The guarantee holds for traffic that looks like the sample. Distribution shift voids it — which is one more reason the schema fingerprint busts the cache on drift.

@@ -1,6 +1,6 @@
 # STROT
 
-**The open decision system.** Compile your intent once with an LLM. Then decide on every record forever — classification, scoring, routing — as type-safe JSON with probabilities, confidence, and a fitted statistical guarantee, on your own hardware, at zero marginal cost.
+**The open decision compiler.** Compile your intent once with an LLM. Then decide on every record forever — classification, scoring, routing — as type-safe JSON with probabilities, confidence, and a fitted statistical guarantee, on your own hardware, at zero marginal cost.
 
 ```
 STROT = Agentic Schema Intent + Compiler Creation & State + Code + Execution + NLU
@@ -73,7 +73,7 @@ result = strot.run(
     golden=[  # promotion gate: artifacts must pass your known answers
         {"record": {"body": "I was double charged"}, "expect": "billing_dispute"},
     ],
-    target_risk=0.1,  # fitted guarantee: ≤10% of dispatched decisions wrong, or abstain
+    target_risk=0.1,  # fitted guarantee: wrong dispatches ≤ 10% of all records (marginal); ambiguous records abstain
 )
 
 result.summary()
@@ -91,7 +91,7 @@ Real model (SupersonicLabs/Julia-1, 144M, CPU), real datasets, clean Docker cont
 | Grounded routing accuracy (398 records, ground truth) | **92.5%** compiled (74.8% naive — the compiler is worth +18pp on the same model) |
 | Hand-tuned ceiling, same model | 100% |
 | Typed decisions vs the leading hosted decision API's own example | near-identical (score 1.79 vs 1.8) |
-| Calibrated dispatch (α=0.15, 14 records) | 13 dispatched, all correct; 1 ambiguous record abstained under the guarantee |
+| Calibrated dispatch (α=0.15, 14 records) | 13 dispatched, all correct; 1 ambiguous record abstained (guarantee is marginal — see [DEVELOPERS.md](DEVELOPERS.md)) |
 | Latency | ~60 ms/record, CPU, in-process |
 | Marginal cost per decision | $0 |
 | LLM calls per runtime record | 0 |
@@ -119,10 +119,12 @@ After that, production runs fully offline. (Never `pip install julia` — that's
 
 - **Compile once, decide forever** — content-addressed artifact cache; schema drift automatically triggers exactly one recompile
 - **Golden-record promotion** — a candidate artifact is executed against your known answers inside the compile loop; only passing artifacts are ever served
-- **Fitted guarantees** — temperature scaling + split conformal prediction, fitted at compile time, baked into the artifact: dispatched decisions are wrong with probability ≤ α (marginal), everything else abstains
+- **Fitted guarantees** — temperature scaling + split conformal prediction (fitted on disjoint folds to preserve validity), baked into the artifact. The guarantee is marginal: under exchangeability, wrong dispatches are ≤ α of all records; non-singleton prediction sets abstain. The conditional-on-dispatch bound (α / dispatch rate) is reported in the artifact's calibration metadata
 - **0% structural hallucination** — output is selection + computation over your registry; nothing is generated at runtime
 - **Model-independent** — the decision model is a slot (`nlu=`): local Julia-1 by default, hosted APIs, or any drop-in selector; the compiler, gates, and calibration keep their value across all of them
 - **Every compile is logged** (`episodes.jsonl`) — the dataset for future compile-policy training
+
+Reproduce these numbers: [benchmarks/](benchmarks/).
 
 ## Documentation
 

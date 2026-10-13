@@ -323,7 +323,16 @@ class StrotCompiler:
             error = StrotCompiler._validate_routing_labels(tree, label_keys)
             if error:
                 return error
-        forbidden = {"torch", "transformers", "openai", "julia", "huggingface_hub"}
+        # Security lint: generated code must be pure computation. Block ML
+        # packages AND stdlib escape hatches to I/O, network, process control,
+        # and dynamic execution. NOTE: this is validation, not a sandbox -
+        # compiling fully untrusted intent requires external isolation.
+        forbidden = {
+            "torch", "transformers", "openai", "julia", "huggingface_hub",
+            "os", "sys", "subprocess", "socket", "urllib", "http", "ftplib",
+            "requests", "shutil", "pathlib", "importlib", "ctypes", "pickle",
+            "multiprocessing", "threading", "tempfile", "io",
+        }
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 names = {alias.name.split(".")[0] for alias in node.names}
@@ -334,6 +343,18 @@ class StrotCompiler:
             bad = names & forbidden
             if bad:
                 return f"Forbidden imports in execution paths: {', '.join(sorted(bad))}"
+        banned_calls = {"eval", "exec", "open", "__import__", "compile", "input"}
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in banned_calls
+            ):
+                return (
+                    f"Forbidden call {node.func.id!r} in execution paths: "
+                    "generated code must be pure computation (no I/O, no "
+                    "dynamic execution)."
+                )
         return None
 
     @staticmethod
@@ -576,12 +597,8 @@ class StrotCompiler:
                 true_indices.append(action_keys.index(label))
         finally:
             sys.modules.pop("strot_golden_gate", None)
-        temperature = calibrate.fit_temperature(distributions, true_indices)
-        quantile = calibrate.conformal_quantile(
-            distributions, true_indices, temperature, alpha=target_risk
-        )
-        return calibrate.calibration_report(
-            distributions, true_indices, temperature, quantile, target_risk
+        return calibrate.fit_split_calibration(
+            distributions, true_indices, alpha=target_risk
         )
 
     def compile(
@@ -612,10 +629,12 @@ class StrotCompiler:
                 When set, the LLM teacher-labels the sample once, a
                 temperature and split-conformal quantile are fitted on the
                 promoted artifact's own distributions, and the artifact
-                dispatches only on singleton prediction sets - carrying the
-                marginal guarantee that a dispatched decision is wrong with
-                probability <= alpha. Requires the decision runtime on the
-                compile box.
+                dispatches only on singleton prediction sets. Guarantee is
+                MARGINAL: the rate of wrong dispatches over all records is
+                <= alpha under exchangeability (the error rate conditional
+                on dispatching is bounded by alpha / dispatch_rate, reported
+                in the calibration metadata). Requires the decision runtime
+                on the compile box.
         """
         if target_risk is not None and not 0 < target_risk < 1:
             raise RouterConfigurationError("target_risk must be in (0, 1).")
