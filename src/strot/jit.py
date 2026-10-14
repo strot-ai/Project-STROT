@@ -133,6 +133,7 @@ def cache_key(
     golden: Optional[Any] = None,
     target_risk: Optional[float] = None,
     measure_labels: bool = False,
+    distill: bool = False,
 ) -> str:
     from . import __version__
 
@@ -148,6 +149,7 @@ def cache_key(
         "golden": golden,
         "target_risk": target_risk,
         "measure_labels": measure_labels,
+        "distill": distill,
     }
     canonical = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -233,6 +235,7 @@ def run(
     golden: Optional[List[Mapping[str, Any]]] = None,
     target_risk: Optional[float] = None,
     measure_labels: Optional[bool] = None,
+    distill: bool = False,
 ) -> RunResult:
     """Process ``data`` against ``query``, JIT-compiling the pipeline on first use.
 
@@ -280,6 +283,11 @@ def run(
             target_risk is set (the teacher labels are already paid for);
             pass True to enable it alone (triggers one teacher call) or
             False to disable.
+        distill: Compile-time distillation - train a logistic head on the
+            frozen encoder's embeddings from teacher-labeled records and bake
+            it in if it beats the zero-shot router on a held-out fold. Use a
+            larger sample_size (100+); requires the [local] runtime deps on
+            the compile box.
     """
     if not action_registry:
         raise RouterConfigurationError(
@@ -296,6 +304,7 @@ def run(
     key = cache_key(
         query, action_registry, nlu, schema, question, confidence_threshold,
         golden=golden, target_risk=target_risk, measure_labels=effective_measure,
+        distill=distill,
     )
     artifact_path, meta_path = _artifact_paths(state, key)
 
@@ -317,6 +326,7 @@ def run(
                 golden=golden,
                 target_risk=target_risk,
                 measure_labels=effective_measure,
+                distill=distill,
             )
         except Exception as exc:
             _log_episode(state, {
@@ -331,7 +341,7 @@ def run(
             "query": query, "actions": list(action_registry),
             "golden_count": len(golden or []), "target_risk": target_risk,
             "attempts": asset.attempts, "calibration": asset.calibration,
-            "label_search": asset.label_search,
+            "label_search": asset.label_search, "model_search": asset.model_search,
         })
         attempts = asset.attempts
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
@@ -348,6 +358,7 @@ def run(
                     "schema": schema_fingerprint(schema),
                     "calibration": asset.calibration,
                     "label_search": asset.label_search,
+                    "model_search": asset.model_search,
                 },
                 indent=2,
             ),

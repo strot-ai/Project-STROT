@@ -135,6 +135,7 @@ Semantics worth knowing:
 | `golden` | None | promotion gate records |
 | `target_risk` | None | α for the fitted conformal guarantee |
 | `measure_labels` | None | score synthesized labels vs bare registry keys on the teacher-labeled sample, keep the winner; defaults ON when `target_risk` is set |
+| `distill` | False | train a logistic head on the frozen encoder's embeddings from teacher-labeled records; baked in only if it beats zero-shot on a held-out fold (three-way split: train/measure/calibrate). Needs `sample_size` ≥ 24 (100+ recommended) and `[local]` deps on the compile box |
 | `execute` | True | False = warm the cache only (no runtime needed) |
 
 Returns `RunResult`: `outcomes` (list of `{index, record, action, confidence, result}`), `fallbacks` (`{index, record, confidence, reason}`), `pipeline` (live, for streaming single records), `cache_hit`, `attempts`, `artifact_path`, `summary()`.

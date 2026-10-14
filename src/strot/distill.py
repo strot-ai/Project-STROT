@@ -1,0 +1,173 @@
+"""Compile-time distillation: fine-tune a tiny head on the frozen encoder.
+
+The LLM teacher labels real sample records once; a logistic head is trained
+on the decision model's own frozen embeddings (seconds, CPU) and baked into
+the artifact as plain weight literals. Mechanically a fine-tune; relationally
+a distillation - the LLM's judgment compressed into the local model.
+
+Fold hygiene is non-negotiable and enforced by :func:`three_way_split`:
+synthetic-or-teacher data may TEACH (train fold), but only held-out real
+records may JUDGE (measurement fold for model search, calibration fold for
+the conformal fit). The distilled candidate ships only if it beats the
+zero-shot router on the measurement fold.
+
+The trainer is pure Python (stdlib) so the core package stays dependency
+free; embeddings come from a pluggable ``embed_fn`` (production: the local
+checkpoint's encoder via torch/transformers; tests: any deterministic fake).
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Any, Callable, Dict, List, Sequence, Tuple
+
+from .exceptions import RouterConfigurationError
+
+#: Maps texts to fixed-size float vectors.
+EmbedFn = Callable[[List[str]], List[List[float]]]
+
+MIN_DISTILL_RECORDS = 24  #: below this, folds are too small to train or judge
+
+
+def make_encoder_embedder(checkpoint: str, batch_size: int = 16) -> EmbedFn:
+    """Production embedder: mean-pooled last hidden state of the checkpoint's
+    frozen encoder (the same encoder the zero-shot runtime uses)."""
+    try:
+        import torch
+        from safetensors.torch import load_file
+        from transformers import AutoConfig, AutoModel, AutoTokenizer
+    except ImportError as exc:
+        raise RouterConfigurationError(
+            "Distillation needs the local runtime deps: pip install strot-ai[local]"
+        ) from exc
+    # The checkpoint stores all weights in the root model.safetensors with an
+    # "encoder." prefix; the encoder/ dir holds only the config.
+    tokenizer = AutoTokenizer.from_pretrained(f"{checkpoint}/tokenizer")
+    config = AutoConfig.from_pretrained(f"{checkpoint}/encoder")
+    model = AutoModel.from_config(config)
+    state = load_file(f"{checkpoint}/model.safetensors")
+    encoder_state = {
+        key[len("encoder."):]: value
+        for key, value in state.items()
+        if key.startswith("encoder.")
+    }
+    if not encoder_state:
+        raise RouterConfigurationError(
+            "Checkpoint has no 'encoder.'-prefixed tensors; cannot build the "
+            "distillation embedder from it."
+        )
+    model.load_state_dict(encoder_state, strict=False)
+    model.eval()
+
+    def embed(texts: List[str]) -> List[List[float]]:
+        vectors: List[List[float]] = []
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start:start + batch_size]
+            inputs = tokenizer(
+                batch, return_tensors="pt", padding=True,
+                truncation=True, max_length=256,
+            )
+            with torch.no_grad():
+                hidden = model(**inputs).last_hidden_state
+            mask = inputs["attention_mask"].unsqueeze(-1).float()
+            pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+            vectors += [[float(x) for x in row] for row in pooled]
+        return vectors
+
+    return embed
+
+
+def three_way_split(indices: Sequence[int]) -> Tuple[List[int], List[int], List[int]]:
+    """Deterministic split: ~50% train, ~25% measure, ~25% calibrate.
+
+    Indices are shuffled with a fixed seed first - a plain interleave can
+    align with periodicity in ordered datasets (e.g. alternating classes)
+    and produce single-class folds.
+    """
+    shuffled = list(indices)
+    random.Random(29).shuffle(shuffled)
+    train = [i for pos, i in enumerate(shuffled) if pos % 4 in (0, 1)]
+    measure = [i for pos, i in enumerate(shuffled) if pos % 4 == 2]
+    calibrate = [i for pos, i in enumerate(shuffled) if pos % 4 == 3]
+    return train, measure, calibrate
+
+
+def train_head(
+    embeddings: Sequence[Sequence[float]],
+    labels: Sequence[int],
+    n_classes: int,
+    epochs: int = 300,
+    learning_rate: float = 0.5,
+    l2: float = 1e-3,
+    seed: int = 13,
+) -> Tuple[List[List[float]], List[float]]:
+    """Multinomial logistic head via plain gradient descent (pure Python).
+
+    Returns (weights[n_classes][dim], bias[n_classes]). Deterministic given
+    the seed. Small-data regime by design: hundreds of examples, seconds.
+    """
+    if not embeddings or len(embeddings) != len(labels):
+        raise ValueError("need equal, non-empty embeddings and labels")
+    dim = len(embeddings[0])
+    rng = random.Random(seed)
+    weights = [[rng.gauss(0.0, 0.01) for _ in range(dim)] for _ in range(n_classes)]
+    bias = [0.0] * n_classes
+    n = len(embeddings)
+    for _ in range(epochs):
+        grad_w = [[0.0] * dim for _ in range(n_classes)]
+        grad_b = [0.0] * n_classes
+        for vector, true_class in zip(embeddings, labels):
+            logits = [
+                sum(w * x for w, x in zip(weights[c], vector)) + bias[c]
+                for c in range(n_classes)
+            ]
+            peak = max(logits)
+            exps = [math.exp(z - peak) for z in logits]
+            total = sum(exps)
+            probs = [e / total for e in exps]
+            for c in range(n_classes):
+                delta = probs[c] - (1.0 if c == true_class else 0.0)
+                grad_b[c] += delta
+                row = grad_w[c]
+                for d, x in enumerate(vector):
+                    row[d] += delta * x
+        for c in range(n_classes):
+            bias[c] -= learning_rate * grad_b[c] / n
+            row_w, row_g = weights[c], grad_w[c]
+            for d in range(dim):
+                row_w[d] -= learning_rate * (row_g[d] / n + l2 * row_w[d])
+    return (
+        [[round(w, 6) for w in row] for row in weights],
+        [round(b, 6) for b in bias],
+    )
+
+
+def head_predict(
+    vector: Sequence[float],
+    weights: Sequence[Sequence[float]],
+    bias: Sequence[float],
+) -> List[float]:
+    """Softmax probabilities of the trained head for one embedding."""
+    logits = [
+        sum(w * x for w, x in zip(row, vector)) + b
+        for row, b in zip(weights, bias)
+    ]
+    peak = max(logits)
+    exps = [math.exp(z - peak) for z in logits]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+
+def head_accuracy(
+    embeddings: Sequence[Sequence[float]],
+    labels: Sequence[int],
+    weights: Sequence[Sequence[float]],
+    bias: Sequence[float],
+) -> float:
+    correct = 0
+    for vector, true_class in zip(embeddings, labels):
+        probs = head_predict(vector, weights, bias)
+        if max(range(len(probs)), key=probs.__getitem__) == true_class:
+            correct += 1
+    return round(correct / len(labels), 4) if labels else 0.0

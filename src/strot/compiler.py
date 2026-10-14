@@ -172,6 +172,7 @@ class CompiledAsset:
     attempts: int
     calibration: Optional[Dict[str, Any]] = None  #: fitted stats (None = uncalibrated)
     label_search: Optional[Dict[str, Any]] = None  #: measured-labeling scores (None = not measured)
+    model_search: Optional[Dict[str, Any]] = None  #: zero-shot vs distilled scores (None = no distill)
 
     def save(self, path: Union[str, Path] = "compiled_pipeline.py") -> Path:
         """Persist the asset as an independent Python file."""
@@ -602,6 +603,18 @@ class StrotCompiler:
             distributions, true_indices, alpha=target_risk
         )
 
+    def _resolve_compile_checkpoint(self) -> str:
+        import os
+
+        override = os.environ.get("STROT_NLU_CHECKPOINT")
+        if override:
+            return override
+        if Path(self.nlu_model).is_dir():
+            return self.nlu_model
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(self.nlu_model)
+
     def _measure_labelings(
         self,
         source: str,
@@ -660,6 +673,7 @@ class StrotCompiler:
         golden: Optional[List[Mapping[str, Any]]] = None,
         target_risk: Optional[float] = None,
         measure_labels: bool = False,
+        distill: bool = False,
     ) -> CompiledAsset:
         """Run the full compile-time pipeline and return the production asset.
 
@@ -731,28 +745,65 @@ class StrotCompiler:
 
         calibration: Optional[Dict[str, Any]] = None
         label_search: Optional[Dict[str, Any]] = None
-        if target_risk is not None or measure_labels:
+        model_search: Optional[Dict[str, Any]] = None
+        runtime_override: Optional[str] = None
+        if target_risk is not None or measure_labels or distill:
             records = _sample_records(sample)
-            teacher_prompt = self.build_teacher_prompt(goal, action_registry, records)
-            labels_code, _ = self._synthesize_with(
-                teacher_prompt,
-                lambda code: self._validate_teacher_labels(
-                    code, len(records), action_registry
-                ),
-            )
-            labels = ast.literal_eval(
-                next(
-                    node.value
-                    for node in ast.parse(labels_code).body
-                    if isinstance(node, (ast.Assign, ast.AnnAssign))
+            if distill:
+                from . import distill as distill_mod
+
+                if len(records) < distill_mod.MIN_DISTILL_RECORDS:
+                    raise RouterConfigurationError(
+                        f"distill needs at least {distill_mod.MIN_DISTILL_RECORDS} "
+                        f"sample records (got {len(records)}); raise sample_size."
+                    )
+            # Chunked teacher labeling: one call per batch keeps the exact-
+            # count contract reliable at any sample size.
+            labels: List[str] = []
+            _CHUNK = 50
+            for _start in range(0, len(records), _CHUNK):
+                _chunk = records[_start:_start + _CHUNK]
+                teacher_prompt = self.build_teacher_prompt(
+                    goal, action_registry, _chunk
                 )
-            )
+                labels_code, _ = self._synthesize_with(
+                    teacher_prompt,
+                    lambda code, _n=len(_chunk): self._validate_teacher_labels(
+                        code, _n, action_registry
+                    ),
+                )
+                labels += ast.literal_eval(
+                    next(
+                        node.value
+                        for node in ast.parse(labels_code).body
+                        if isinstance(node, (ast.Assign, ast.AnnAssign))
+                    )
+                )
             action_keys = list(action_registry)
             true_indices = [action_keys.index(label) for label in labels]
 
+            # Fold hygiene: with distill, teacher-labeled records are split so
+            # training, judging (model/label search), and calibration never
+            # share data. Without distill, judging and calibration use all
+            # records (back-compatible).
+            if distill:
+                from . import distill as distill_mod
+
+                train_ix, measure_ix, calib_ix = distill_mod.three_way_split(
+                    range(len(records))
+                )
+            else:
+                train_ix, measure_ix, calib_ix = [], list(range(len(records))), list(
+                    range(len(records))
+                )
+            records_measure = [records[i] for i in measure_ix]
+            true_measure = [true_indices[i] for i in measure_ix]
+            records_calib = [records[i] for i in calib_ix]
+            labels_calib = [labels[i] for i in calib_ix]
+
             if measure_labels:
                 winner, winner_labels, scores = self._measure_labelings(
-                    source, records, true_indices, action_registry, question, goal
+                    source, records_measure, true_measure, action_registry, question, goal
                 )
                 label_search = {"scores": scores, "winner": winner}
                 if winner != "synthesized":
@@ -779,9 +830,79 @@ class StrotCompiler:
                         final_code = candidate_code
                         source = candidate_source
 
+            if distill:
+                from . import distill as distill_mod
+
+                checkpoint = self._resolve_compile_checkpoint()
+                embed = distill_mod.make_encoder_embedder(checkpoint)
+                module = self._load_candidate_module(source)
+                try:
+                    contexts = [
+                        module.route_context(dict(record)) for record in records
+                    ]
+                    routing_question = question or (
+                        f"Which execution path best achieves the goal: {goal}?"
+                    )
+                    router = module._RuntimeRouter()
+                    zero_shot_correct = 0
+                    for i in measure_ix:
+                        decision = router.select(
+                            contexts[i], routing_question, module._ROUTING_OPTIONS
+                        )
+                        if decision.index == true_indices[i]:
+                            zero_shot_correct += 1
+                finally:
+                    import sys as _sys
+
+                    _sys.modules.pop("strot_golden_gate", None)
+                zero_shot_acc = round(zero_shot_correct / len(measure_ix), 4)
+
+                vectors = embed([contexts[i] for i in train_ix + measure_ix])
+                train_vectors = vectors[: len(train_ix)]
+                measure_vectors = vectors[len(train_ix):]
+                head_w, head_b = distill_mod.train_head(
+                    train_vectors,
+                    [true_indices[i] for i in train_ix],
+                    n_classes=len(action_keys),
+                )
+                distilled_acc = distill_mod.head_accuracy(
+                    measure_vectors, true_measure, head_w, head_b
+                )
+                model_search = {
+                    "zero_shot": zero_shot_acc,
+                    "distilled": distilled_acc,
+                    "n_train": len(train_ix),
+                    "n_measure": len(measure_ix),
+                    "winner": "distilled" if distilled_acc > zero_shot_acc else "zero_shot",
+                }
+                if model_search["winner"] == "distilled":
+                    head_code = (
+                        "\n\n# Compile-time-distilled head (train fold only)\n"
+                        f"HEAD_WEIGHTS = {head_w!r}\n"
+                        f"HEAD_BIAS = {head_b!r}"
+                    )
+                    candidate_code = final_code + head_code
+                    candidate_source = self._assemble(
+                        schema, goal, dict(action_registry), candidate_code,
+                        question, runtime="distilled",
+                    )
+                    golden_error = (
+                        self._test_golden_pipeline(candidate_source, golden)
+                        if golden
+                        else None
+                    )
+                    if golden_error:
+                        model_search["winner_rejected_by_golden"] = True
+                        model_search["winner"] = "zero_shot"
+                    else:
+                        final_code = candidate_code
+                        source = candidate_source
+                        runtime_override = "distilled"
+
             if target_risk is not None:
                 calibration = self._fit_calibration(
-                    source, records, labels, action_registry, question, goal, target_risk
+                    source, records_calib, labels_calib, action_registry,
+                    question, goal, target_risk,
                 )
                 source = self._assemble(
                     schema,
@@ -792,6 +913,7 @@ class StrotCompiler:
                     temperature=float(calibration["temperature"]),
                     conformal_q=float(calibration["conformal_quantile"]),
                     calibration=calibration,
+                    runtime=runtime_override,
                 )
                 if golden:
                     error = self._test_golden_pipeline(source, golden)
@@ -808,12 +930,13 @@ class StrotCompiler:
         return CompiledAsset(
             source=source,
             nlu_model=self.nlu_model,
-            runtime_kind=self.runtime_kind,
+            runtime_kind=runtime_override or self.runtime_kind,
             goal=goal,
             schema=schema,
             attempts=attempts,
             calibration=calibration,
             label_search=label_search,
+            model_search=model_search,
         )
 
     @staticmethod
@@ -1125,10 +1248,11 @@ class StrotCompiler:
         temperature: float = 1.0,
         conformal_q: Optional[float] = None,
         calibration: Optional[Dict[str, Any]] = None,
+        runtime: Optional[str] = None,
     ) -> str:
         header = templates.ASSET_HEADER_TEMPLATE.format(
             nlu_model=self.nlu_model,
-            runtime_kind=self.runtime_kind,
+            runtime_kind=runtime or self.runtime_kind,
             goal=goal,
             threshold=self.confidence_threshold,
             temperature=repr(temperature),
@@ -1136,11 +1260,12 @@ class StrotCompiler:
             calibration_literal=repr(calibration or {}),
             schema_literal=repr(schema.to_dict()),
         )
-        runtime_template = (
-            templates.HOSTED_RUNTIME_TEMPLATE
-            if self.runtime_kind == "hosted"
-            else templates.LOCAL_RUNTIME_TEMPLATE
-        )
+        if runtime == "distilled":
+            runtime_template = templates.DISTILLED_RUNTIME_TEMPLATE
+        elif self.runtime_kind == "hosted":
+            runtime_template = templates.HOSTED_RUNTIME_TEMPLATE
+        else:
+            runtime_template = templates.LOCAL_RUNTIME_TEMPLATE
         runtime = runtime_template.format(nlu_model=self.nlu_model)
         handlers_literal = (
             "{"

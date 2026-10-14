@@ -138,6 +138,76 @@ class _RuntimeRouter:
         )
 '''
 
+DISTILLED_RUNTIME_TEMPLATE = '''\
+# --- Runtime architecture: compile-time-distilled head on the frozen encoder ---
+# The logistic head below was trained at compile time on teacher-labeled real
+# records (train fold only); its weights are baked in as literals.
+try:
+    import torch
+    from safetensors.torch import load_file
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
+except ImportError as _exc:  # pragma: no cover - environment guard
+    raise RuntimeError(
+        "This distilled asset embeds records with the local encoder: "
+        "pip install strot-ai[local]"
+    ) from _exc
+
+
+class _RuntimeRouter:
+    """Frozen encoder embeddings + distilled logistic head."""
+
+    def __init__(self) -> None:
+        checkpoint = os.environ.get("STROT_NLU_CHECKPOINT")
+        if checkpoint is None:
+            from pathlib import Path
+
+            if Path(NLU_MODEL).is_dir():
+                checkpoint = NLU_MODEL
+            else:
+                from huggingface_hub import snapshot_download
+
+                checkpoint = snapshot_download(NLU_MODEL)
+        self._tokenizer = AutoTokenizer.from_pretrained(checkpoint + "/tokenizer")
+        config = AutoConfig.from_pretrained(checkpoint + "/encoder")
+        self._model = AutoModel.from_config(config)
+        state = load_file(checkpoint + "/model.safetensors")
+        self._model.load_state_dict(
+            {{
+                key[len("encoder."):]: value
+                for key, value in state.items()
+                if key.startswith("encoder.")
+            }},
+            strict=False,
+        )
+        self._model.eval()
+
+    def select(self, context: str, question: str, options: Sequence[str]) -> RouteDecision:
+        inputs = self._tokenizer(
+            [context], return_tensors="pt", padding=True,
+            truncation=True, max_length=256,
+        )
+        with torch.no_grad():
+            hidden = self._model(**inputs).last_hidden_state
+        mask = inputs["attention_mask"].unsqueeze(-1).float()
+        pooled = ((hidden * mask).sum(1) / mask.sum(1).clamp(min=1.0))[0]
+        vector = [float(x) for x in pooled]
+        logits = [
+            sum(w * x for w, x in zip(row, vector)) + b
+            for row, b in zip(HEAD_WEIGHTS, HEAD_BIAS)
+        ]
+        peak = max(logits)
+        exps = [math.exp(z - peak) for z in logits]
+        total = sum(exps)
+        probs = [e / total for e in exps]
+        index = max(range(len(probs)), key=probs.__getitem__)
+        return RouteDecision(
+            index=index,
+            option=options[index],
+            confidence=probs[index],
+            distribution=dict(zip(options, probs)),
+        )
+'''
+
 HOSTED_RUNTIME_TEMPLATE = '''\
 # --- Runtime architecture: Implementation Beta (hosted cloud API) ---
 # Deliberately torch/transformers-free to keep the container footprint tiny.

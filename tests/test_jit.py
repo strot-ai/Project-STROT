@@ -447,6 +447,82 @@ class TestMeasuredLabels:
         assert plain.cache_key != measured.cache_key
 
 
+class TestDistill:
+    # 28 records (>= MIN_DISTILL_RECORDS), alternating classes.
+    BIG_SAMPLE = [
+        {"ticket_id": i, "body": ("double billing charge refund" if i % 2 == 0
+                                  else "app crash defect bug"), "tier": "pro"}
+        for i in range(28)
+    ]
+    TEACHER = ("```python\nLABELS = ["
+               + ", ".join('"billing"' if i % 2 == 0 else '"defect"' for i in range(28))
+               + "]\n```")
+
+    @staticmethod
+    def _keyword_embedder(texts):
+        # Linearly separable 3-dim features: billing-ish, defect-ish, bias.
+        return [
+            [float("billing" in t or "charge" in t), float("crash" in t or "defect" in t), 1.0]
+            for t in texts
+        ]
+
+    def test_distilled_head_wins_over_bad_zero_shot(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.distill as distill_mod
+        monkeypatch.setattr(
+            distill_mod, "make_encoder_embedder", lambda ckpt: self._keyword_embedder
+        )
+        bad_labels = VALID_PATHS.replace(
+            'ROUTING_LABELS = {"billing": "billing", "defect": "defect"}',
+            'ROUTING_LABELS = {"billing": "zzz", "defect": "qqq"}',
+        )
+        llm = ScriptedLLM([bad_labels, self.TEACHER])
+        result = strot.run(
+            self.BIG_SAMPLE, QUERY, REGISTRY, llm=llm, state=tmp_path,
+            sample_size=28, distill=True, execute=False,  # distilled artifact needs torch to run
+        )
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        search = meta["model_search"]
+        assert search["winner"] == "distilled"
+        assert search["distilled"] > search["zero_shot"]
+        assert search["n_train"] == 14 and search["n_measure"] == 7
+        source = result.artifact_path.read_text()
+        assert "HEAD_WEIGHTS" in source and "distilled" in meta["runtime_kind"]
+
+    def test_zero_shot_kept_when_head_cannot_beat_it(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.distill as distill_mod
+        monkeypatch.setattr(
+            distill_mod, "make_encoder_embedder",
+            lambda ckpt: (lambda texts: [[1.0, 1.0] for _ in texts]),  # useless embeddings
+        )
+        llm = ScriptedLLM([VALID_PATHS, self.TEACHER])
+        result = strot.run(
+            self.BIG_SAMPLE, QUERY, REGISTRY, llm=llm, state=tmp_path,
+            sample_size=28, distill=True,
+        )
+        meta = json.loads(result.artifact_path.with_suffix(".json").read_text())
+        assert meta["model_search"]["winner"] == "zero_shot"
+        assert "HEAD_WEIGHTS" not in result.artifact_path.read_text()
+        # zero-shot artifact executes normally under the fake runtime
+        assert len(result.outcomes) == 28
+
+    def test_distill_requires_enough_records(self, tmp_path, fake_runtime):
+        with pytest.raises(RouterConfigurationError, match="sample_size"):
+            strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS, "x"]),
+                      state=tmp_path, distill=True)
+
+    def test_distill_is_part_of_cache_key(self, tmp_path, fake_runtime, monkeypatch):
+        import strot.distill as distill_mod
+        monkeypatch.setattr(
+            distill_mod, "make_encoder_embedder", lambda ckpt: self._keyword_embedder
+        )
+        plain = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                          llm=ScriptedLLM([VALID_PATHS]), state=tmp_path, sample_size=28)
+        distilled = strot.run(self.BIG_SAMPLE, QUERY, REGISTRY,
+                              llm=ScriptedLLM([VALID_PATHS, self.TEACHER]),
+                              state=tmp_path, sample_size=28, distill=True, execute=False)
+        assert plain.cache_key != distilled.cache_key
+
+
 class TestEpisodeLog:
     def test_promoted_compile_logged_once(self, tmp_path, fake_runtime):
         strot.run(SAMPLE, QUERY, REGISTRY, llm=ScriptedLLM([VALID_PATHS]), state=tmp_path)

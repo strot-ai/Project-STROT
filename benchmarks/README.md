@@ -71,3 +71,35 @@ Measured 2026-10-13 (same environment as above):
 ## Input-formatting ablation: `ablation_formats.py`
 
 Same model, same records, same question — only state/option formatting varies. This isolates how much of routing accuracy is integration rather than model capability (answer: ~25 points). Runs the decision model directly; no LLM required.
+
+## Hard-task case study: hate detection (`tweet_eval` hate, 400 test tweets)
+
+The honest limits of a 144M generalist, measured across every STROT lever
+(majority-class baseline: 59.0%; this test split is notoriously hard - published
+task-trained models score ~55-60 macro-F1):
+
+| Condition | Accuracy | Hate recall | Coverage |
+|---|---|---|---|
+| Zero-shot naive / compiled / measured | 47.0 / 41.2 / 53.0% | 57-100% | 400/400 |
+| Zero-shot calibrated @ a=0.1 | - | - | 0/400 (abstained on ALL - correct refusal) |
+| Distilled (v0.10.0), uncalibrated | 59.0% | 45.1% | 400/400 |
+| Distilled @ a=0.3 | 63.8% | 45.9% | 229/400 |
+
+Findings:
+
+1. **Compile-time distillation is the largest single lever measured**: +28pp
+   over zero-shot on the held-out fold (0.44 -> 0.72); +6 to +18pp on test.
+   The chunked teacher labeled 200 real tweets; the head trained in-compile.
+2. **It still is not enough for this task**: 59% equals the majority baseline
+   and hate recall ~45% misses over half the hate. The general encoder's
+   embeddings cap the head - implicit hate needs task-trained representations.
+3. **The guarantee machinery told the truth twice**: at a=0.1 calibration
+   abstained on everything (a ~70%-accurate model cannot promise 10% error);
+   at a=0.3 it dispatched 57% of traffic at +5pp selective accuracy and routed
+   the uncertain 43% to review. Abstention-as-honesty worked at every stage.
+4. **Fold scores overestimate test** (0.70 fold -> 0.59 test): 50-point folds
+   are noisy judges and this dataset has known train/test shift. Report test
+   numbers, never fold numbers.
+5. Practical conclusion for hard semantic tasks: slot a task-trained
+   specialist into `nlu=` or accept hosted inference for the hard slice;
+   distillation shines where the encoder's representations suffice.
