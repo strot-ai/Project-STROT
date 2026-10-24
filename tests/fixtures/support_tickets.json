@@ -1,0 +1,11 @@
+[
+  {"record": {"ticket_id": 201, "body": "I paid once, but my card was charged twice for the same invoice.", "customer": "Zoë Pérez"}, "expect": "billing_dispute"},
+  {"record": {"ticket_id": 202, "body": "The invoice includes a charge for a plan I already cancelled.", "customer": "Sam"}, "expect": "billing_dispute"},
+  {"record": {"ticket_id": 203, "body": "My approved refund still has not reached my bank account.", "customer": "Alex"}, "expect": "billing_dispute"},
+  {"record": {"ticket_id": 204, "body": "The app crashes every time I open the dashboard after the update.", "customer": "Taylor"}, "expect": "technical_defect"},
+  {"record": {"ticket_id": 205, "body": "The report export button fails with HTTP 500. Please fix this bug.", "customer": "Riley"}, "expect": "technical_defect"},
+  {"record": {"ticket_id": 206, "body": "The sign-in page is blank after the latest release. I cannot use the app.", "customer": "Morgan"}, "expect": "technical_defect"},
+  {"record": {"ticket_id": 207, "body": "Please delete my account and erase all of my personal data.", "customer": "Jordan"}, "expect": "account_lifecycle"},
+  {"record": {"ticket_id": 208, "body": "I need a copy of all personal data you hold about me for a privacy request.", "customer": "Casey"}, "expect": "account_lifecycle"},
+  {"record": {"ticket_id": 209, "body": "Close my old account and remove its stored personal information.", "customer": "Robin"}, "expect": "account_lifecycle"}
+]

@@ -72,7 +72,7 @@ def make_encoder_embedder(checkpoint: str, batch_size: int = 16) -> EmbedFn:
                 hidden = model(**inputs).last_hidden_state
             mask = inputs["attention_mask"].unsqueeze(-1).float()
             pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1.0)
-            vectors += [[float(x) for x in row] for row in pooled]
+            vectors.extend(pooled.tolist())
         return vectors
 
     return embed

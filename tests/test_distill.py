@@ -1,6 +1,9 @@
 """Unit tests for the pure-Python distillation trainer and compile integration."""
 
+import math
+import os
 import random
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,7 +12,42 @@ from strot.distill import (
     head_predict,
     three_way_split,
     train_head,
+    make_encoder_embedder,
 )
+from strot.router import RouteDecision
+from strot.templates import DISTILLED_RUNTIME_TEMPLATE
+
+
+def test_encoder_and_distilled_vectors(monkeypatch, tmp_path):
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    safetensors = pytest.importorskip("safetensors.torch")
+
+    class Encoder:
+        def load_state_dict(self, *args, **kwargs):
+            pass
+
+        def eval(self):
+            pass
+
+        def __call__(self, attention_mask):
+            hidden = torch.tensor([[[1.0, 0.0], [3.0, 0.0]]])
+            return SimpleNamespace(last_hidden_state=hidden.expand(attention_mask.shape[0], -1, -1))
+
+    encoder = Encoder()
+    tokenizer = lambda texts, **kwargs: {"attention_mask": torch.ones(len(texts), 2)}
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda _: tokenizer)
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda _: None)
+    monkeypatch.setattr(transformers.AutoModel, "from_config", lambda _: encoder)
+    monkeypatch.setattr(safetensors, "load_file", lambda _: {"encoder.x": torch.zeros(1)})
+    monkeypatch.setenv("STROT_NLU_CHECKPOINT", str(tmp_path))
+    assert make_encoder_embedder(str(tmp_path))(["one", "two"]) == [[2.0, 0.0]] * 2
+    ns = dict(Any=object, Sequence=list, RouteDecision=RouteDecision, math=math, os=os,
+              HEAD_WEIGHTS=[[1.0, 0.0], [0.0, 1.0]], HEAD_BIAS=[0.0, 0.0])
+    exec(DISTILLED_RUNTIME_TEMPLATE.format(nlu_model="test"), ns)
+    decision = ns["_RuntimeRouter"]().select("one", "which?", ["first", "second"])
+    assert decision.option == "first"
+    assert decision.confidence == pytest.approx(1 / (1 + math.exp(-2)))
 
 
 class TestTrainer:

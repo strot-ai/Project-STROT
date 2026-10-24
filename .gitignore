@@ -34,5 +34,6 @@ Thumbs.db
 poetry.lock
 
 # Local scratch
+.strot/
 .venv-test/
 examples/compiled_pipeline.py

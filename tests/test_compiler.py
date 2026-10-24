@@ -231,5 +231,11 @@ class TestCompiledAssetExecution:
 
     def test_low_confidence_triggers_asset_fallback(self, monkeypatch):
         ns = self._run_asset(monkeypatch, {"selected_index": 0, "confidence": 0.2})
-        with pytest.raises(ns["FallbackException"]):
+        with pytest.raises(ns["FallbackException"]) as error:
             ns["CompiledPipeline"]().process({"ticket_id": 7, "body": "???"})
+        assert error.value.confidence == pytest.approx(0.2)
+
+    def test_default_route_skips_calibration_math(self, monkeypatch):
+        ns = self._run_asset(monkeypatch, {"selected_index": 1, "confidence": 0.95})
+        ns["math"] = None
+        assert ns["CompiledPipeline"]().process({"ticket_id": 7})["action"] == "defect"

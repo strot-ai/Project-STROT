@@ -43,6 +43,15 @@ is a self-contained Python file: a small local model arbitrates every record,
 nothing is generated at runtime, every output is bounded, and records the model
 isn't sure about abstain instead of guessing.
 
+To compile with a subscription CLI, use
+`llm="claude-cli/claude-opus-4-8"` or `llm="codex-cli/gpt-6-luna"`.
+Sign in through `claude` or `codex login` first. Omit `/<model>` to use the
+CLI default. Model access and usage limits depend on your account.
+The CLI only runs at compile time. See [the example](examples/end_to_end.py).
+For a CLI outside PATH, pass a client such as
+`llm=strot.codex_cli_llm_client(cli="/path/to/codex", model="gpt-6-luna")`.
+For Claude, use `llm=strot.claude_cli_llm_client(cli="/path/to/claude")`.
+
 ## How it works
 
 Two phases. The expensive, nondeterministic one happens once; the cheap one runs
@@ -141,13 +150,21 @@ calibration, and gate don't change.
 ## Install
 
 ```bash
-pip install strot-ai            # core, pure stdlib
-pip install strot-ai[local]     # + the local decision model (torch/transformers)
-pip install strot-ai[hosted]    # + openai, for a hosted decision runtime
-pip install strot-ai[anthropic] # + anthropic, for the synthesizer
+pip install strot-ai             # core: pure stdlib
+pip install "strot-ai[local]"     # + local model dependencies (torch/transformers)
+pip install "strot-ai[hosted]"    # + openai, for API synthesis or runtime routing
+pip install "strot-ai[anthropic]" # + anthropic, for Anthropic API synthesis
 ```
 
-For offline production, bake the model into your image at build time:
+Extras install optional Python packages. They do not select a provider or sign you in.
+For OpenAI API synthesis, install `[hosted]`, set `OPENAI_API_KEY`, and pass
+`llm="openai/gpt-4o"`. For Anthropic API synthesis, install `[anthropic]`, set
+`ANTHROPIC_API_KEY`, and pass `llm="anthropic/claude-opus-4-8"`.
+Subscription CLI synthesis needs the CLI and its subscription login. It needs
+neither the `[hosted]` nor the `[anthropic]` extra. Check which login the CLI uses.
+Other credentials can override a saved subscription login.
+
+Bake the local model into your image for offline production:
 
 ```dockerfile
 RUN pip install strot-ai[local] \

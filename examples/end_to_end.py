@@ -1,29 +1,51 @@
-"""End-to-end STROT walkthrough.
+"""Compile and run a ticket router with strot.run().
 
-Compile time: introspect a dataset sample, synthesize execution paths with a
-large generative LLM, and bake the default Julia-1 local runtime into a
-standalone asset. Runtime: load the asset and feed it live records.
+From the repo root, install the core package with pip install -e .
+Or create and activate a .venv with uv:
 
-Run it:
+    uv venv --python 3.14 .venv && uv pip install -e . && . .venv/bin/activate
 
-    # With a real synthesizer LLM (recommended):
-    export OPENAI_API_KEY=sk-...
-    python examples/end_to_end.py
+After installation, choose a compile-time LLM:
 
-    # Offline demo (deterministic stub synthesizer, no API key needed):
-    python examples/end_to_end.py
+    # Offline stub. No API key or Julia needed:
+    python3 examples/end_to_end.py --compile-only
+
+    # Codex: run codex login and sign in with ChatGPT first:
+    codex login status
+    python3 examples/end_to_end.py --llm codex-cli/gpt-6-luna --compile-only
+
+    # Claude Code: run claude and /login with your subscription first:
+    python3 examples/end_to_end.py --llm claude-cli/claude-opus-4-8 --compile-only
+
+To run the offline example in an isolated environment with uvx:
+
+    uvx --python 3.14 --from . python examples/end_to_end.py --compile-only
+
+Omit /<model> to use the CLI default. Check which login the CLI uses.
+Other credentials can override a saved subscription login.
+Your account controls model access and usage limits. Codex must support
+--ignore-user-config and --ephemeral. Claude must support --safe-mode.
+Codex shell commands and web search are disabled during synthesis.
+
+Without --llm, the example uses the offline stub. Use a separate --state
+directory to compare LLMs. Changing --llm alone does not clear the saved code.
+
+The --compile-only flag saves code without loading Julia. Review that code
+before use. To run the tickets, install strot-ai[local], run
+strot.prefetch_nlu(install=True), and omit --compile-only.
+
+Official CLI documentation:
+https://developers.openai.com/codex/auth
+https://code.claude.com/docs/en/authentication
 """
 
 from __future__ import annotations
 
-import importlib.util
+import argparse
 import json
-import os
-import sys
 from pathlib import Path
 
-from strot import FallbackException, StrotCompiler
-from strot.compiler import openai_llm_client
+import strot
 
 # ---------------------------------------------------------------------- #
 # 1. A representative sample of the live data stream                      #
@@ -47,7 +69,15 @@ ACTION_REGISTRY = {
 def stub_synthesizer(prompt: str) -> str:
     """Offline stand-in for GPT-4o/Claude: returns contract-compliant paths."""
     return '''```python
-from typing import Any, Dict
+ROUTING_LABELS = {
+    "billing_dispute": "billing invoice double charge refund",
+    "technical_defect": "app crash bug broken export",
+    "account_lifecycle": "account deletion personal data privacy",
+}
+
+
+def route_context(record: dict) -> str:
+    return str(record.get("body", ""))
 
 
 def execute_billing_dispute(record: dict) -> dict:
@@ -73,49 +103,26 @@ def execute_account_lifecycle(record: dict) -> dict:
 
 
 def main() -> None:
-    # ------------------------------------------------------------------ #
-    # 2. COMPILE TIME: synthesize the self-routing asset                  #
-    # ------------------------------------------------------------------ #
-    synthesizer = (
-        openai_llm_client(model="gpt-4o")
-        if os.environ.get("OPENAI_API_KEY")
-        else stub_synthesizer
-    )
-
-    compiler = StrotCompiler(
-        nlu_model="SupersonicLabs/Julia-1",  # the default local CPU runtime
-        llm_client=synthesizer,
-        max_retries=3,
-    )
-    asset = compiler.compile(
-        sample=SUPPORT_TICKETS,
-        goal=GOAL,
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--llm", default="stub", help="Synthesizer spec: stub, codex-cli, claude-cli, or provider/model")
+    parser.add_argument("--compile-only", action="store_true", help="Save without loading Julia")
+    parser.add_argument("--state", type=Path, default=Path(".strot/end_to_end"))
+    args = parser.parse_args()
+    synthesizer = stub_synthesizer if args.llm == "stub" else args.llm
+    result = strot.run(
+        data=SUPPORT_TICKETS,
+        query=GOAL,
         action_registry=ACTION_REGISTRY,
+        llm=synthesizer,
+        state=args.state,
+        execute=not args.compile_only,
     )
-    asset_path = asset.save(Path(__file__).parent / "compiled_pipeline.py")
-    print(f"Compiled {asset.runtime_kind} asset in {asset.attempts} attempt(s): {asset_path}")
-
-    # ------------------------------------------------------------------ #
-    # 3. RUNTIME: load the standalone asset and feed it live data         #
-    # ------------------------------------------------------------------ #
-    # Requires the local extra (torch + transformers) for Julia-1:
-    #   pip install strot-ai[local]
-    try:
-        spec = importlib.util.spec_from_file_location("compiled_pipeline", asset_path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-        pipeline = module.CompiledPipeline()
-    except Exception as exc:
-        print(f"Runtime not available here ({exc}); asset is still valid for production.")
-        sys.exit(0)
-
-    for ticket in SUPPORT_TICKETS:
-        try:
-            outcome = pipeline.process(ticket)
-            print(json.dumps(outcome, default=str))
-        except (FallbackException, module.FallbackException) as exc:
-            print(f"Ticket {ticket['ticket_id']} routed to fallback: {exc}")
+    print(json.dumps(result.summary(), default=str))
+    print(f"Standalone asset: {result.artifact_path}")
+    for outcome in result.outcomes:
+        print(json.dumps(outcome, default=str))
+    for fallback in result.fallbacks:
+        print(json.dumps(fallback, default=str))
 
 
 if __name__ == "__main__":

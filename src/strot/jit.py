@@ -22,6 +22,7 @@ import hashlib
 import importlib.util
 import json
 import sys
+from threading import RLock
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
@@ -32,6 +33,7 @@ from .compiler import (
     StrotCompiler,
     anthropic_llm_client,
     claude_cli_llm_client,
+    codex_cli_llm_client,
     openai_llm_client,
 )
 from .exceptions import RouterConfigurationError, SchemaIntrospectionError
@@ -39,10 +41,11 @@ from .router import CONFIDENCE_THRESHOLD, DEFAULT_NLU_MODEL
 from .schema import DatasetSchema, introspect_schema
 
 #: ``llm`` parameter: a client callable, or a lazy spec string resolved only
-#: on a cache miss ("openai/gpt-4o", "gpt-4o", "claude-cli", "claude-cli/sonnet").
+#: on a cache miss ("openai/gpt-4o", "gpt-4o", "codex-cli", "claude-cli/sonnet").
 LLMSpec = Union[str, LLMClient]
 
 _KEY_PREFIX_LEN = 16
+_ARTIFACT_LOCK = RLock()
 
 
 @dataclass
@@ -166,6 +169,8 @@ def _resolve_llm(llm: LLMSpec) -> LLMClient:
         provider, slash, model = llm.partition("/")
         if provider in ("claude-cli", "claude-code"):
             return claude_cli_llm_client(model=model or None)
+        if provider == "codex-cli":
+            return codex_cli_llm_client(model=model or None)
         if provider == "anthropic":
             return anthropic_llm_client(model) if model else anthropic_llm_client()
         if provider == "openai":
@@ -174,7 +179,8 @@ def _resolve_llm(llm: LLMSpec) -> LLMClient:
             return openai_llm_client(llm)
     raise RouterConfigurationError(
         f"Cannot resolve llm spec {llm!r}; pass a callable, 'anthropic/<model>', "
-        "'openai/<model>', a bare OpenAI model name, or 'claude-cli[/<model>]'."
+        "'openai/<model>', a bare OpenAI model name, 'codex-cli[/<model>]', "
+        "or 'claude-cli[/<model>]'."
     )
 
 
@@ -184,23 +190,34 @@ def _artifact_paths(state: Union[str, Path], key: str) -> "tuple[Path, Path]":
     return state_dir / f"{stem}.py", state_dir / f"{stem}.json"
 
 
+def _artifact_module_name(path: Path, key: str) -> str:
+    location = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+    return f"strot_compiled_{key}_{location}"
+
+
 def _load_artifact(path: Path, key: str) -> Any:
-    module_name = f"strot_compiled_{key[:_KEY_PREFIX_LEN]}"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception as exc:
-        del sys.modules[module_name]
-        raise RouterConfigurationError(
-            f"Compiled artifact {path} failed to load: {exc}. The local runtime "
-            "needs strot-ai[local] (torch/transformers); the hosted runtime "
-            "needs strot-ai[hosted] (openai)."
-        ) from exc
-    return module
+    with _ARTIFACT_LOCK:
+        module_name = _artifact_module_name(path, key)
+        try:
+            stat = path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+            cached = sys.modules.get(module_name)
+            if cached is not None and getattr(cached, "__strot_source_stamp__", None) == stamp:
+                return cached
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            # Read source directly so a fast recompile cannot reuse stale bytecode.
+            exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
+        except Exception as exc:
+            sys.modules.pop(module_name, None)
+            raise RouterConfigurationError(
+                f"Compiled artifact {path} failed to load: {exc}. The local runtime "
+                "needs strot-ai[local] (torch/transformers); the hosted runtime "
+                "needs strot-ai[hosted] (openai)."
+            ) from exc
+        module.__strot_source_stamp__ = stamp
+        return module
 
 
 def _log_episode(state: Union[str, Path], payload: Dict[str, Any]) -> None:
@@ -255,6 +272,8 @@ def run(
         action_registry: Ordered mapping of action key -> description; defines
             the bounded decision space enforced on the ML decision model.
         llm: Synthesizer spec or callable; resolved lazily, only on cache miss.
+            ``codex-cli[/<model>]`` and ``claude-cli[/<model>]`` use CLI
+            authentication. API clients need provider credentials.
         nlu: Runtime decision model baked into the asset (local or hosted).
         state: Artifact-store directory — the persisted "compiled flag + code".
         sample_size: Records used for schema profiling and synthesis grounding.
@@ -356,7 +375,9 @@ def run(
         })
         attempts = asset.attempts
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        asset.save(artifact_path)
+        with _ARTIFACT_LOCK:
+            asset.save(artifact_path)
+            sys.modules.pop(_artifact_module_name(artifact_path, key), None)
         meta_path.write_text(
             json.dumps(
                 {
@@ -486,7 +507,9 @@ def decide(
         })
         attempts = asset.attempts
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        asset.save(artifact_path)
+        with _ARTIFACT_LOCK:
+            asset.save(artifact_path)
+            sys.modules.pop(_artifact_module_name(artifact_path, key), None)
         meta_path.write_text(
             json.dumps(
                 {

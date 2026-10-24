@@ -190,9 +190,17 @@ To add a new local engine, implement the strategy contract — `select(state, qu
 |---|---|
 | `"anthropic/claude-opus-4-8"` | Anthropic API (`[anthropic]` extra, `ANTHROPIC_API_KEY`) |
 | `"openai/gpt-4o"` or bare model | OpenAI API (`[hosted]` extra, `OPENAI_API_KEY`) |
+| `"codex-cli"` / `"codex-cli/<model>"` | Codex CLI with saved login. Run `codex login` for subscription access. No SDK required. |
 | `"claude-cli"` / `"claude-cli/<model>"` | local Claude Code CLI as proxy (no key, no SDK) |
 
 Specs resolve **only on a cache miss** — a warm production box never needs the LLM dependency or key.
+
+Both CLIs run in an isolated temporary directory and keep CLI authentication.
+Codex skips user configuration and disables project instructions, shell commands,
+and web search. Claude uses `--safe-mode` to skip customizations and disables
+built-in tools and session persistence. See the
+[Codex configuration reference](https://developers.openai.com/codex/config-reference)
+and [Claude CLI reference](https://code.claude.com/docs/en/cli-reference).
 
 ## Episode log
 
@@ -217,6 +225,14 @@ monkeypatch.setenv("STROT_NLU_CHECKPOINT", str(tmp_path))      # skip downloads
 
 and script the LLM with a deterministic callable. The repo's `make_paths()` helper shows the exact synthesis contract a fake must satisfy. For integration tests against the real model, bake the checkpoint into a Docker image with `prefetch_nlu` (the repo's test images build in under a minute once the heavy layers are cached).
 
+To test the real Julia model without downloads, use an installed inference package and a cached checkpoint:
+
+```bash
+STROT_TEST_CHECKPOINT=/path/to/Julia-1 python -m pytest -q tests/test_quality.py
+```
+
+This test uses nine ticket cases and a fixed compiler response. It does not test live LLM output or general model accuracy.
+
 ## Versioning and cache busting
 
 The artifact cache key hashes: package version, query/config, registry, decision model, question, threshold, schema fingerprint (field names + types — not values), goldens, and target_risk. Consequences:
@@ -225,3 +241,6 @@ The artifact cache key hashes: package version, query/config, registry, decision
 - Schema **drift** (new/removed/retyped fields) busts the key automatically; value changes don't.
 - Package upgrades bust all caches on purpose (templates may have changed).
 - Artifacts are content-addressed: name artifacts by key, keep the previous one for rollback, and alert on unexpected recompiles in prod.
+
+Loaded modules are keyed by the full cache key and canonical artifact path.
+File metadata changes trigger a reload. Concurrent loads share a completed module.

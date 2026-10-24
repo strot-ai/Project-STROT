@@ -46,6 +46,14 @@ def test_schema_json_is_prompt_ready():
     assert '"semantic_type"' in payload and '"null_rate"' in payload
 
 
+@pytest.mark.parametrize("value", [
+    "2026-10-19", "2026-10-19T12:34:56", "2026-10-19 12:34:56",
+    "19/10/2026", "10/19/2026", "2026-10-19T12:34:56Z",
+])
+def test_temporal_formats(value):
+    assert introspect_schema([{"date": value}]).fields[0].semantic_type == "temporal"
+
+
 @pytest.mark.parametrize("bad", [[], "not a dataset", [1, 2, 3], {"col": 42}])
 def test_rejects_unprofilable_samples(bad):
     with pytest.raises(SchemaIntrospectionError):

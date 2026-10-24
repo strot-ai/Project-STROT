@@ -193,7 +193,7 @@ class _RuntimeRouter:
             hidden = self._model(**inputs).last_hidden_state
         mask = inputs["attention_mask"].unsqueeze(-1).float()
         pooled = ((hidden * mask).sum(1) / mask.sum(1).clamp(min=1.0))[0]
-        vector = [float(x) for x in pooled]
+        vector = pooled.tolist()
         logits = [
             sum(w * x for w, x in zip(row, vector)) + b
             for row, b in zip(HEAD_WEIGHTS, HEAD_BIAS)
@@ -440,21 +440,23 @@ class CompiledPipeline:
         decision = self._router.select(context, question, _ROUTING_OPTIONS)
         # Inference-level correction (fitted at compile): temperature +
         # per-class bias over the arbiter's distribution.
-        raw = [
-            max(decision.distribution.get(opt, 0.0), 1e-12)
-            for opt in _ROUTING_OPTIONS
-        ]
-        scores = [
-            math.log(p) / TEMPERATURE + (CLASS_BIAS[i] if CLASS_BIAS else 0.0)
-            for i, p in enumerate(raw)
-        ]
-        peak = max(scores)
-        exps = [math.exp(s - peak) for s in scores]
-        total = sum(exps)
-        probs = [e / total for e in exps]
-
-        index = max(range(len(probs)), key=probs.__getitem__)
-        confidence = probs[index]
+        index = decision.index
+        confidence = decision.confidence
+        if CONFORMAL_Q is not None or DISPATCH_CUTOFF is not None:
+            raw = [
+                max(decision.distribution.get(opt, 0.0), 1e-12)
+                for opt in _ROUTING_OPTIONS
+            ]
+            scores = [
+                math.log(p) / TEMPERATURE + (CLASS_BIAS[i] if CLASS_BIAS else 0.0)
+                for i, p in enumerate(raw)
+            ]
+            peak = max(scores)
+            exps = [math.exp(s - peak) for s in scores]
+            total = sum(exps)
+            probs = [e / total for e in exps]
+            index = max(range(len(probs)), key=probs.__getitem__)
+            confidence = probs[index]
         abstain_reason = None
         if CONFORMAL_Q is not None:
             included = [i for i, p in enumerate(probs) if p >= 1.0 - CONFORMAL_Q]
@@ -483,10 +485,6 @@ class CompiledPipeline:
                         decision.confidence, CONFIDENCE_THRESHOLD
                     )
                 )
-            else:
-                index = decision.index
-                confidence = decision.confidence
-
         if abstain_reason is None:
             action_key = _ACTION_KEYS[index]
             result = _HANDLERS[action_key](dict(record))

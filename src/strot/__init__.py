@@ -12,6 +12,7 @@ from .compiler import (
     StrotCompiler,
     anthropic_llm_client,
     claude_cli_llm_client,
+    codex_cli_llm_client,
     openai_llm_client,
 )
 from .exceptions import (
@@ -50,6 +51,7 @@ __all__ = [
     "openai_llm_client",
     "anthropic_llm_client",
     "claude_cli_llm_client",
+    "codex_cli_llm_client",
     "StrotError",
     "CompilationError",
     "FallbackException",

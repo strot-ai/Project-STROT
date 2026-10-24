@@ -24,6 +24,7 @@ _CATEGORICAL_CARDINALITY_RATIO = 0.5
 _TEMPORAL_FORMATS = (
     "%Y-%m-%d",
     "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S%z",
     "%Y-%m-%d %H:%M:%S",
     "%d/%m/%Y",
     "%m/%d/%Y",
@@ -162,17 +163,18 @@ class SchemaProfiler:
 
     @staticmethod
     def _parses_as_temporal(value: str) -> bool:
+        try:
+            datetime.fromisoformat(value)
+            return True
+        except ValueError:
+            pass
         for fmt in _TEMPORAL_FORMATS:
             try:
                 datetime.strptime(value, fmt)
                 return True
             except ValueError:
                 continue
-        try:
-            datetime.fromisoformat(value)
-            return True
-        except ValueError:
-            return False
+        return False
 
 
 def introspect_schema(sample: Any) -> DatasetSchema:

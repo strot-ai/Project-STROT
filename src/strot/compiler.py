@@ -103,39 +103,79 @@ def claude_cli_llm_client(
     cli: str = "claude",
     timeout: float = 600.0,
 ) -> LLMClient:
-    """Convenience factory: use a local Claude Code CLI as an LLM proxy.
+    """Use Claude Code for synthesis.
 
-    Shells out to ``claude -p`` in headless mode, so synthesis rides the
-    developer's existing Claude session — no API key, no SDK dependency.
+    Requires ``--safe-mode`` support. This skips user customizations and
+    keeps CLI authentication. Built-in tools and session persistence are
+    disabled. No SDK is required.
     """
+    return _cli_llm_client("claude", cli, model, timeout)
+
+
+def codex_cli_llm_client(
+    model: Optional[str] = None,
+    cli: str = "codex",
+    timeout: float = 600.0,
+) -> LLMClient:
+    """Use ``codex exec`` for synthesis.
+
+    Run ``codex login`` for ChatGPT subscription access. The CLI must support
+    ``--ignore-user-config`` and ``--ephemeral``. No SDK is required.
+    Shell commands, web search, and project instructions are disabled.
+    """
+    return _cli_llm_client("codex", cli, model, timeout)
+
+
+def _cli_llm_client(backend: str, cli: str, model: Optional[str], timeout: float) -> LLMClient:
     import shutil
     import subprocess
+    import tempfile
 
     cli_path = shutil.which(cli)
     if cli_path is None:
         raise RouterConfigurationError(
-            f"claude_cli_llm_client requires the {cli!r} CLI on PATH "
-            "(install Claude Code: https://claude.com/claude-code)."
+            f"Cannot find the {cli!r} CLI on PATH. Install {backend} and sign in."
         )
+    cli_path = str(Path(cli_path).absolute())
 
     def _call(prompt: str) -> str:
-        command = [cli_path, "-p", "--output-format", "text"]
-        if model:
-            command += ["--model", model]
-        proc = subprocess.run(
-            command,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if proc.returncode != 0:
-            raise CompilationError(
-                f"claude CLI synthesizer exited {proc.returncode}: "
-                f"{proc.stderr.strip()[:500]}",
-                attempts=0,
-            )
-        return proc.stdout
+        # Use stdin for context and skip project instructions.
+        with tempfile.TemporaryDirectory(prefix="strot-synthesis-") as cwd:
+            output = Path(cwd) / "response.txt"
+            if backend == "codex":
+                command = [
+                    cli_path, "exec", "--ignore-user-config", "--ephemeral",
+                    "-c", "project_doc_max_bytes=0", "-c", "features.shell_tool=false",
+                    "-c", 'web_search="disabled"',
+                    "--sandbox", "read-only", "--skip-git-repo-check",
+                    "--color", "never", "--output-last-message", str(output),
+                ]
+            else:
+                command = [
+                    cli_path, "--safe-mode", "-p", "--output-format", "text", "--tools", "",
+                    "--no-session-persistence",
+                ]
+            if model:
+                command += ["--model", model]
+            try:
+                proc = subprocess.run(
+                    command, input=prompt, capture_output=True, text=True,
+                    encoding="utf-8", timeout=timeout, cwd=cwd,
+                )
+                if proc.returncode != 0:
+                    detail = (proc.stdout.strip() + "\n" + proc.stderr.strip()).strip()[:500]
+                    raise CompilationError(
+                        f"{backend} CLI synthesizer exited {proc.returncode}: "
+                        f"{detail}", attempts=0,
+                    )
+                response = output.read_text(encoding="utf-8") if backend == "codex" else proc.stdout
+            except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
+                raise CompilationError(
+                    f"{backend} CLI synthesizer failed: {exc}", attempts=0,
+                ) from exc
+            if not response.strip():
+                raise CompilationError(f"{backend} CLI synthesizer returned no text.", attempts=0)
+            return response
 
     return _call
 
